@@ -1,0 +1,321 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..3c5ca92 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -6,6 +6,7 @@
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
++#include <pexpert/arm/protos.h> /* pe_sweet_gic_self_sgi on the GICv2 path */
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+@@ -209,6 +210,15 @@ SweetCPU::initCPU(bool boot)
+ void
+ SweetCPU::signalCPU(IOCPU *target)
+ {
++#if defined(SWEET_GICV2)
++	/*
++	 * GIC-400: TargetListFilter = 0b10 signals the requesting CPU
++	 * interface itself (single-CPU bring-up, so target == self).
++	 */
++	(void)target;
++	pe_sweet_gic_self_sgi(SWEET_IPI_SGI);
++	__builtin_arm_isb(ISB_SY);
++#else
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	unsigned int logical = target->getCPUNumber();
+ 	if (logical >= topology->num_cpus) {
+@@ -227,6 +237,7 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
++#endif /* SWEET_GICV2 */
+ }
+ 
+ kern_return_t
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..d6a25e6 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -38,6 +38,7 @@
+ #include <arm64/machine_machdep.h>
+ #include <arm64/monotonic.h>
+ #include <arm64/instructions.h>
++#include <pexpert/arm/protos.h> /* pe_sweet_gic_* on the GICv2 path */
+ 
+ #include <kern/debug.h>
+ #include <kern/restartable.h>
+@@ -1856,7 +1857,43 @@ sleh_irq(arm_saved_state_t *state)
+ #endif
+ 
+ 
+-#if defined(SWEET)
++#if defined(SWEET_GICV2)
++	/*
++	 * Exynos 7904 (SWEET_GICV2): GIC-400 with TrustZone. Ack from the
++	 * memory-mapped GICC; routing matches the GICv3 branch: timer,
++	 * SGI, then IOKit.
++	 */
++	uint32_t iar = pe_sweet_gic_iar();
++	uint32_t intid = iar & GICC_IAR_INTID_MASK;
++
++	if (intid == GIC_SPURIOUS_IRQ) {
++		return; /* spurious */
++	}
++	if (intid == sweet_vtimer_intid) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++		cdp->cpu_decrementer = -1; /* Large */
++		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		rtclock_intr(TRUE);
++		INTERRUPT_MASKED_DEBUG_END();
++		pe_sweet_gic_eoi(iar);
++	} else if (intid < 16) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
++		/* Ack before handling so an IPI raised meanwhile is not lost */
++		pe_sweet_gic_eoi(iar);
++		__builtin_arm_isb(ISB_SY);
++		cpu_signal_handler();
++	} else {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		if (cdp->interrupt_handler) {
++			cdp->interrupt_handler(cdp->interrupt_target,
++			    cdp->interrupt_refCon,
++			    cdp->interrupt_nub,
++			    intid);
++		}
++		pe_sweet_gic_eoi(iar);
++	}
++	__builtin_arm_isb(ISB_SY);
++#elif defined(SWEET)
+ 	/*
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+@@ -1924,6 +1961,14 @@ sleh_fiq(arm_saved_state_t *state)
+ 	int preemption_level = sleh_get_preemption_level();
+ #endif
+ 
++#if defined(SWEET_GICV2)
++	/*
++	 * GICv2 systems have no FIQ source: Group 0 belongs to TrustZone
++	 * and DAIF.F is never unmasked. Swallow any stray FIQ.
++	 */
++	return;
++#else
++
+ #if MONOTONIC_FIQ
+ 	uint64_t pmcr0 = 0, upmsr = 0;
+ #endif /* MONOTONIC_FIQ */
+@@ -2017,6 +2062,7 @@ sleh_fiq(arm_saved_state_t *state)
+ 		panic("fiq type %u changed preemption level from %d to %d", type, preemption_level, sleh_get_preemption_level());
+ 	}
+ #endif
++#endif /* SWEET_GICV2 */
+ }
+ 
+ void
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..7a58077 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,9 +222,148 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#else /* !HAS_GIC_V3 */
++#if defined(SWEET_GICV2)
++/*
++ * Exynos 7904: GIC-400 (GICv2). No redistributors, no ICC system
++ * registers; the CPU interface is memory-mapped GICC. The ADT reg
++ * property of /arm-io/gic is {gicc_base, gicc_size, gicd_base,
++ * gicd_size}.
++ */
++static vm_offset_t gicc_base;
++static vm_offset_t gicd_base;
++
++static uint32_t
++sweet_gicc_read32(uint32_t offset)
++{
++	return *((volatile uint32_t *) (gicc_base + offset));
++}
++
++static void
++sweet_gicc_write32(uint32_t offset, uint32_t value)
++{
++	*((volatile uint32_t *) (gicc_base + offset)) = value;
++}
++
++static uint32_t
++sweet_gicd_read32(uint32_t offset)
++{
++	return *((volatile uint32_t *) (gicd_base + offset));
++}
++
++static void
++sweet_gicd_write32(uint32_t offset, uint32_t value)
++{
++	*((volatile uint32_t *) (gicd_base + offset)) = value;
++}
++
++uint32_t
++pe_sweet_gic_iar(void)
++{
++	return sweet_gicc_read32(GICC_IAR);
++}
++
++void
++pe_sweet_gic_eoi(uint32_t iar)
++{
++	sweet_gicc_write32(GICC_EOIR, iar);
++}
++
++/*
++ * TargetListFilter = 0b10 (self only) raises the SGI on the requesting
++ * interface without needing its interface number.
++ */
++void
++pe_sweet_gic_self_sgi(uint32_t intid)
++{
++	__builtin_arm_dsb(DSB_ISHST);
++	sweet_gicd_write32(GICD_SGIR,
++	    GICD_SGIR_FILTER_SELF | (intid & 0xF));
++	__builtin_arm_isb(ISB_SY);
++}
++
++void
++pe_init_fiq()
++{
++	/*
++	 * gicd_base is 0x0 only before it's initialized by the boot
++	 * processor; SecureDT routines are not thread-safe.
++	 */
++	if (!gicd_base) {
++		int error;
++		DTEntry entry;
++		void const *prop;
++		unsigned int prop_size;
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++
++		gicc_base = ml_io_map(soc_base_phys + ((uint64_t const *)prop)[0],
++		    ((uint64_t const *)prop)[1]);
++		gicd_base = ml_io_map(soc_base_phys + ((uint64_t const *)prop)[2],
++		    ((uint64_t const *)prop)[3]);
++		if (!gicc_base || !gicd_base) {
++			panic("%s: cannot map GICC/GICD regions", __func__);
++		}
++
++		/*
++		 * Boot CPU only, before RO-late lockdown: the vtimer PPI
++		 * INTID comes from the same ADT property as on the v3 path.
++		 */
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++		kprintf("SWEET GIC v2: gicc %p gicd %p vtimer INTID %u\n",
++		    (void *)gicc_base, (void *)gicd_base, sweet_vtimer_intid);
++	}
++
++	/*
++	 * SGI/PPI registers are banked per security state (NS view here)
++	 * and configured on every call; SPI-side writes are idempotent.
++	 * Everything XNU owns is Group 1 (non-secure), mirroring the
++	 * TrustZone split of the v3 branch.
++	 */
++	sweet_gicc_write32(GICC_PMR, 0xFF);
++	sweet_gicc_write32(GICC_BPR, 0);
++	sweet_gicc_write32(GICC_CTLR, GICC_CTLR_ENABLE);
++
++	for (unsigned int n = 0; n < 16; n++) {
++		sweet_gicd_write32(GICD_IGROUPR + 4 * n, 0xFFFFFFFF);
++	}
++	for (unsigned int i = 0; i < 128; i += 4) {
++		sweet_gicd_write32(GICD_IPRIORITYR + i, 0xA0A0A0A0);
++	}
++	sweet_gicd_write32(GICD_ISENABLER,
++	    (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	sweet_gicd_write32(GICD_CTLR,
++	    sweet_gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++	__builtin_arm_isb(ISB_SY);
++}
+ #else
+ void
+ pe_init_fiq()
+ {
+ }
+-#endif
++#endif /* SWEET_GICV2 */
++#endif /* !HAS_GIC_V3 */
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..27df569 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,12 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++#if defined(SWEET_GICV2)
++/* GIC-400 helpers for sleh.c / SweetCPU (see pe_fiq.c) */
++uint32_t pe_sweet_gic_iar(void);
++void pe_sweet_gic_eoi(uint32_t iar);
++void pe_sweet_gic_self_sgi(uint32_t intid);
++#endif /* SWEET_GICV2 */
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..3ec6949 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -80,4 +80,29 @@
+ #define ICC_SRE_SRE                             0x1
+ /* End of GICv3 register definitions */
+ 
++/*
++ * Exynos 7904 (Galaxy A30s) variation inside the SWEET machine config:
++ * the SoC has a GIC-400 (GICv2, memory-mapped GICC) instead of the
++ * GICv3 system-register based controller of the reference phone. When
++ * SWEET_GICV2 is defined, every ICC_* system register access is
++ * replaced by the pe_fiq/sleh GICv2 branches (see patch 0078).
++ */
++#define SWEET_GICV2                             1
++
++/* GICv2 register offsets (ARM IHI 0022, GIC-400 TRM) */
++#define GICC_CTLR                               0x00
++#define GICC_CTLR_ENABLE                        0x1 /* Group 1 enable, NS view */
++#define GICC_PMR                                0x04
++#define GICC_BPR                                0x08
++#define GICC_IAR                                0x0C
++#define GICC_IAR_INTID_MASK                     0x3FF
++#define GICC_EOIR                               0x10
++
++#define GICD_IGROUPR                            0x080
++#define GICD_ISENABLER                          0x100
++#define GICD_IPRIORITYR                         0x400
++#define GICD_SGIR                               0xF00
++/* TargetListFilter = 0b10: interrupt the requesting CPU interface only */
++#define GICD_SGIR_FILTER_SELF                   (2U << 8)
++
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */
