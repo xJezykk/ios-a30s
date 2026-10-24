@@ -1,0 +1,31 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index f30b793..62923ad 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -347,6 +347,13 @@ ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+ #
+ ARM64_PLKSEG_ADDR  =0xfffffff004004000
+ ARM64_LINK_ADDR    =0xfffffff007004000
++#
++# 4K granule nests the commpage in a 1GB L1 block (pmap.c static_assert at
++# pmap_insert_commpage), which must sit at/above MACH_VM_MAX_ADDRESS. The macOS
++# 47-bit user VA limit (0x00007FFFFE000000) breaks that, so SWEET uses the
++# non-macOS limit (0xFC0000000). (a30s patch 0084)
++#
++LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1 -DSWEET_4K_USERVA=1
+ endif
+ endif
+ 
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index c013288..cc52d06 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,7 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(SWEET_4K_USERVA)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
