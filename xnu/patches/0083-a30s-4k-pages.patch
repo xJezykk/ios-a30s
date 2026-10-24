@@ -1,0 +1,104 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..596b9e0 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -335,6 +335,23 @@ ifneq ($(filter $(PLATFORM),MacOSX),)
+ LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
++ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++#
++# a30s (SWEET) boots with 4K granule pages. At 4K the Mach-O head's
++# bootstrap page tables (create_bootstrap_mapping) are an L1-rooted,
++# 3-level walk -- no L0 layer is ever built, so the root can only cover
++# S <= 39 virtual bits (T1SZ_BOOT 25 = the top 512GB window). The 16K
++# link bases above sit in the top-2^47 window and are unreachable by
++# the 4K boot walk; the head would die before __start ever runs. Reuse
++# the 512GB-window link bases (same layout as the non-MacOSX arm64
++# defaults above) while keeping ARM_LARGE_MEMORY=1: the large-memory
++# bootstrap pool (ARM_PGBYTES * 34) is what maps our DRAM (comment in
++# pmap.h: "up to (16*64GB) 1TB"); the small pool (ARM_PGBYTES * 8) is
++# sized for small-memory buckets and cannot cover 4GB. (a30s patch 0083)
++#
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
+ endif
+ 
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..de8c649 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -680,19 +680,35 @@ Lkernelcache_base_found:
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
++	 * Splash framebuffer: 32MB of Normal-NC in the EXISTING V=P L2
++	 * table. Both framebuffer and RAM use L1 index 0; another call to
++	 * create_bootstrap_mapping would replace the RAM L2 table. All
++	 * bring-up RAM (and the fb) is below 4GB, so the first V=P L2 page
++	 * is bootstrap_pagetables + 2*PGBYTES.
++	 *
++	 * Granularity-agnostic (a30s patch 0083): an L2 block covers 32MB
++	 * with 16K pages but only 2MB with the 4K pages the A30s ARMv8.0
++	 * cores require, so the TTE loop stores (0x02000000 >>
++	 * ARM_TT_L2_SHIFT) entries — 16 or 1 — starting at the entry that
++	 * maps 0x9c000000. Attrs live all below the block-granularity bits
++	 * and the high NX/PNX bits are far above any two-bit carry reach,
++	 * so adding the block size to the TTE value steps the PA field
++	 * without touching them.
+ 	 */
+ 	MOV64	x10, 0x9c000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+-	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+-	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	add		x13, x13, x12, lsl #TTE_SHIFT
++	orr		x11, x11, x10
++	MOV64	x12, (0x02000000 >> ARM_TT_L2_SHIFT)
++	MOV64	x14, (1 << ARM_TT_L2_SHIFT)
++Lsweet_splash_r:
++	str		x11, [x13], #8
++	subs	x12, x12, #1
++	add		x11, x11, x14
++	b.ne	Lsweet_splash_r
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index cc1c3d3..e9df91d 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,7 +34,23 @@
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+ #define __ARM_PAN_AVAILABLE__     1
+-#define __ARM_16K_PG__            1
++
++/*
++ * The Galaxy A30s (Exynos 7904) cores are Cortex-A73 + Cortex-A53 =
++ * ARMv8.0-a: FEAT_16K granule page tables (v8.2-LSE era) do not exist
++ * there, and the boot MMU turn-on with TCR_EL1.TG0=1b10 dies in the
++ * first subordinate walk (reproduced in QEMU --cpu cortex-a53 with a
++ * prefetch-abort storm at the head's own vectors, and frozen silently
++ * on the phone a whole flash cycle before the M0/M1 instrument round
++ * isolated the block). So SWEET stays at the 4K default here, the same
++ * pattern upstream BCM2837 uses: by NOT defining __ARM_16K_PG__ at all.
++ * Do NOT define it to 0 either — several pages key with #ifdef, so the
++ * record must stay absent (proc_reg.h 830/864 use #if, 946/964/1288/1445
++ * use #ifdef; only an absent record satisfies both families).
++ * ARM_PGSHIFT becomes 12 and TCR_TG0/TG1_GRANULE_SIZE become 4KB through
++ * the generic #else branches; every page-size conditional in vm_kern.c,
++ * vm_param.h and vm_compressor_algorithms.c evaluates to its 4K arm.
++ */
+ 
+ #define HAS_GIC_V3                1
+ 

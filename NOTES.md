@@ -684,15 +684,44 @@ rd=md0 ignition_level=1 wdt=-1` style; console = sweetfbcon on fb.
   very first act — MMU on with a 16K-granule TCR — is architecturally
   unsupported on this silicon. This retro-explains every P2.x silent
   freeze despite a green QEMU.
-- FIX (in flight): rebuild the CI kernel with 4K pages. Knob =
-  `#define __ARM_16K_PG__ 1` in pexpert/pexpert/arm64/SWEET.h:37 →
-  proc_reg.h ARM_PGSHIFT 14→12 and TCR_TG0/TG1_GRANULE_SIZE 16K→4K
-  (lines 831/865). Ships as a NEW CI patch 0083-a30s-4k-pages.patch
-  (patch series runs 0081 upstream + 0082 GICv2 today). 4K build
-  caveat in start.s: the SWEET splash fb block maps 32 MB as ONE
-  16K-granule L2 block at 0x9c000000; in a 4K kernel an L2 block is
-  2 MB → must loop over 16 L2 entries. Binary patching stays the tool
-  for small steps, but page granularity requires the rebuild.
+- FIX: rebuild the CI kernel with 4K pages — patch
+  0083-a30s-4k-pages.patch (3 files, 57+/8−) on top of 0001..0081
+  upstream + 0082 GICv2:
+  1. SWEET.h drops the `__ARM_16K_PG__` knob from the define block
+     (never define-as-0: proc_reg.h mixes `#if`/`#ifdef` on it).
+     ARM_PGSHIFT 14→12, TG0/TG1 encodings and the pmap subpage/L1
+     flags then take their native 4K values from the existing
+     tables. proc_reg.h is NOT touched by 0083 — an earlier idea to
+     pin T1SZ_BOOT=17 for LARGE-memory 4K was wrong and reverted.
+  2. makedefs/MakeInc.def: at 4K the head's create_bootstrap_mapping
+     is an L1-rooted 3-level walk (no L0 layer is ever built) →
+     S <= 39 → T1SZ_BOOT stays 25 → the boot VA window is the top
+     512 GB (starts 0xffffff8000000000). The 16K link base
+     0xfffffe0007004000 is outside it, so a granule-only fix would
+     still die pre-console. For CURRENT_MACHINE_CONFIG=SWEET only,
+     the link bases move to 0xfffffff004004000 /
+     0xfffffff007004000 (the 512 GB-window literals the non-MacOSX
+     arm64 configs already use), while ARM_LARGE_MEMORY stays 1:
+     the LARGE bootstrap pool (ARM_PGBYTES*34, "up to 16*64GB 1TB"
+     per pmap.h) covers our 4GB DRAM; the SMALL pool
+     (ARM_PGBYTES*8) is sized for ≤2GB and would overflow.
+  3. start.s: the SWEET splash fb block maps 32 MB at 0x9c000000 as
+     ONE 16K L2 block; at 4K an L2 block is 2 MB → Lsweet_splash_r
+     loops over 16 sequential L2 entries (granule-agnostic, zero
+     attr-bit pollution; the 16K constants byte-match the flashed
+     kernel's head, both granules assemble clean under llvm-mc).
+  Binary patching stays the tool for small steps, but page
+  granularity requires this rebuild.
+- Flash-side checks stay valid at 4K: mkpayload PAGE=0x4000
+  rounding, shim PAGE_16K placement constants, Samsung boot-image
+  pack page=0x800; the mkpayload slide formula keeps machine
+  tolerance (worst-case slide ≪ the link-base headroom).
+- CI silent-skip trap (dxb applies via `git apply --check`, warning
+  + skip on mismatch, CI stays green) re-gunned: two fresh clones
+  replayed vanilla 1b191cb + 0001..0081 + 0082, then 0083 with
+  `git apply --check` (PASS) + apply; post-patch SWEET.h / start.s /
+  MakeInc.def byte-identical to the authoring tree (patch md5
+  72f24f177f1ff1ad4b2579c778262f5f).
 - CI validation for the 4K cycle MUST include `--cpu cortex-a53`
   full-kernel-boot: the current 16K CI kernel storms under a53 (75 MB
   log); the 4K build has to sail (both bars + 868 B-class log) before
@@ -700,9 +729,18 @@ rd=md0 ignition_level=1 wdt=-1` style; console = sweetfbcon on fb.
 
 ## Next up (after the P2.6 instrument round)
 
-1. 0083-a30s-4k-pages.patch authored and applied: 4K-page CI kernel
-   (SWEET.h knob + start.s splash L2 loop), CI green, --cpu
-   cortex-a53 full-boot validation, then the next flash round.
+1. 0083-a30s-4k-pages.patch authored + validated (SWEET.h knob
+   removal + start.s splash L2 loop + MakeInc.def SWEET-only
+   link-base move; two fresh-clone replays green, skip-proof) →
+   push to CI, decode the 4K TCR from the ELF (expect T0SZ 25 /
+   T1SZ 25 / TG0 0 / TG1 2 / IPS 2), QEMU full matrix INCLUDING
+   `--cpu cortex-a53` full boot, then the next flash round.
+4. Shim black-box console: mirror the console log to 0xEC500000
+   (tail of the stock FDT framebuffer reserve 0xEC000000+0x1400000,
+   DDR that SBOOT/s3cfb/console/TWRP all leave alone) + final flush
+   on the loader-exit paths; TWRP-side readback via adb pull of
+   /proc/kcore, fallback = static aarch64 reader. Build during the
+   CI wait; rides the next flash round.
 2. Live verification of the GICv2 path (0082): vtimer PPI 27 via
    sleh_gicv2 branch, SGI self-signaling from SweetCPU::signalCPU.
 2. DW-MMC driver for eMMC (the biggest new driver; reference: Samsung
