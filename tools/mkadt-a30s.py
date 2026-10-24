@@ -5,11 +5,18 @@ Port of mkadt.py (ios-sweet) to the Galaxy A30s (Exynos 7904). Only what
 the early boot path actually reads; every MMIO address comes from the
 A30s live FDT (P1 recon, NOTES.md). Usage:
 
-  mkadt-a30s.py OUT.adt [--dump]
+  mkadt-a30s.py OUT.adt [--dump] [--qemu]
+
+--qemu switches the boot-core reg to 0 for the QEMU virt board: there
+the single TCG vCPU reports Aff1=0/Aff0=0 (mask MPIDR_AFF1|MPIDR_AFF0
+in ml_get_cpu_number), while the phone boot core is P1-measured
+MPIDR=0x80000100 (Aff1=1, Aff0=0). A mismatch trips asserts in
+machine_routines.c on BOTH sides.
 
 Data model differences vs the Qualcomm reference:
   - single CPU node (P2.0 is single-core; patch 0082 has no SMP IPIs
-    beyond the self-SGI), boot core physical id 0x100 (A55 cluster);
+    beyond the self-SGI), boot core physical id 0x100 (A73 big cluster,
+    P1 sec_probe-measured MPIDR 0x80000100);
   - GIC-400: /arm-io/gic reg = {GICC 0x12302000+4K, GICD 0x12301000+4K},
     SOC-relative like every /arm-io child (patch 0082 reads exactly
     this layout and optional virtual-timer-intid);
@@ -41,6 +48,11 @@ SOC_BASE = 0x01000000
 # GIC-400 (fdt interrupt-controller node: 4 regions GICD/GICC/GICH/GICV)
 GICC, GICC_SIZE = 0x12302000, 0x1000
 GICD, GICD_SIZE = 0x12301000, 0x1000
+# --qemu re-homes the GIC-400 on the QEMU virt board map, where the
+# emulated GIC-400 lives: GICD 0x08000000 / GICC 0x08010000, so the
+# kernel's v2 pe_init_fiq programs the real controller (run the VM with
+# -M virt,gic-version=2).
+GICC_QEMU, GICD_QEMU = 0x08010000, 0x08000000
 # fbcon: s3cfb.bootloaderfb=0xEC000000 (also a stock reserved-memory node)
 FB, FB_SIZE = 0xec000000, 0x1400000
 FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
@@ -48,10 +60,14 @@ FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
 A30S_ECID = 0x4133305300000001
 TIMEBASE = 26000000		# CNTFRQ at boot (P1.3), FDT clock-frequency 0x18cba80
 VTIMER_INTID = 27		# FDT timer: type1 PPI 11 (virtual) -> INTID 27
-# cpus=1 for P2.0: boot core only (mpidr 0x80000100: Aff1=1, Aff0=0,
-# A55). Single CPU = patch 0082 GICv2 self-SGI scope.
+# cpus=1 for P2.0: boot core only (P1 sec_probe measured the boot MPIDR
+# as 0x80000100 = Aff1 1, Aff0 0 - the big Cortex-A73 cluster). Single
+# CPU = patch 0082 GICv2 self-SGI scope.
+#
+# --qemu replaces it with 0: QEMU's virt vCPU has all affinities 0, and
+# ml_get_cpu_number() masks MPIDR_EL1 to AFF1|AFF0=0xffff and compares
+# against the raw ADT reg (assert at machine_routines.c:1244).
 BOOT_CORE_PHYS_ID = 0x100
-
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW; /product
@@ -92,11 +108,14 @@ def node(name, props=(), children=()):
 
 
 def build():
+    qemu = '--qemu' in sys.argv
     # Carve the panic log off the top so the kernel never allocates
     # over it; /pram sits in the 1 MiB hole, below the 0xF5400000
     # reserved band.
     panic_base = PHYS_BASE + MEM_SIZE
-    gicc_rel, gicd_rel = GICC - SOC_BASE, GICD - SOC_BASE
+    gicc, gicd = (GICC_QEMU, GICD_QEMU) if qemu else (GICC, GICD)
+    boot_core_reg = 0 if qemu else BOOT_CORE_PHYS_ID
+    gicc_rel, gicd_rel = gicc - SOC_BASE, gicd - SOC_BASE
 
     seed = os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -144,8 +163,8 @@ def build():
         node('cpu0', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('arm,cortex-a53') + cstr('ARM,v8')),
-            ('reg', u32(BOOT_CORE_PHYS_ID)),	# MPIDR Aff1:Aff0, not logical
+            ('compatible', cstr('arm,cortex-a73') + cstr('ARM,v8')),
+            ('reg', u32(boot_core_reg)),	# MPIDR Aff1:Aff0, not logical
             ('cpu-id', u32(0)),
             ('cluster-id', u32(0)),
             ('cluster-type', u32(0)),		# homogeneous SMP, not AMP

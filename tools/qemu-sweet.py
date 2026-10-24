@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """Boot a SWEETXNU payload (tools/mkpayload.py) in QEMU's virt board.
 
-  qemu-sweet.py PAYLOAD OUTDIR [--secs N] [--gdb] [--live-serial]
+  qemu-sweet.py PAYLOAD OUTDIR [--secs N] [--gdb] [--live-serial] [--watch]
+  qemu-sweet.py --shim SHIM-Image-Payload OUTDIR [--watch] ...
+
+--shim boots the REAL a30s shim instead of the stub: the shim binary
+(shim/out/Image-payload) is loaded at SHIM_PA (the shim is
+position-independent and its payload_info block is PC-relative, so any
+free RAM works) and a QEMU-generated virt DTB rides at DTB_PA, handed
+in x0 exactly like SBOOT hands its FDT. No RAM is pre-placed and no
+stub jump into the kernel happens: the shim itself finds the SWEETXNU
+payload it embeds, copies it and jumps. In this mode boot_args->Video
+is the shim's own A30s panel constant (0xEC000000), so BOTH the early
+painter and kprintf use the adtfb canvas — fb.png stays black.
 
 Does what shim/loader.c does on the phone, but on the host: places the
 kernel segments, ADT and boot_args at their physical addresses and starts
@@ -24,8 +35,16 @@ import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
+# Second console: the ADT "sweet-fbcon" the kernel's fbcon_probe() maps
+# (mkadt-a30s.py FB constants; absolute phys, 720x1560, 2880 B stride).
+ADT_FB, ADT_FB_W, ADT_FB_H, ADT_FB_STRIDE = 0xEC000000, 720, 1560, 2880
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
+# --shim mode: SBOOT-like handoff, relocated to QEMU's RAM map. The
+# phone loads the shim at 0x10008000, which is below virt RAM start,
+# but the shim is position-independent (shim/build.sh drift fix).
+SHIM_PA = 0x42000000	# shim image home (16.7 MB up to ~0x43100000)
+DTB_PA = 0x41000000	# QEMU's generated FDT, handed to the shim in x0
 BOOT_LINE_LENGTH = 608
 
 
@@ -104,15 +123,52 @@ def stub(ba_pa, entry_pa):
     return struct.pack('<4I2Q', 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_pa)
 
 
-def write_png(path, raw):
+def dump_virt_dtb(path, cpu, ram_gib, gicv2):
+    """QEMU's own generated FDT for the virt board (handed to the shim in x0)."""
+    subprocess.run(['qemu-system-aarch64',
+                    '-M', f'virt,gic-version={2 if gicv2 else 3}',
+                    '-cpu', cpu, '-m', f'{ram_gib}G', '-display', 'none',
+                    '-machine', f'dumpdtb={path}'], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def find_embedded_payload(image):
+    """Parse the shim's A30P payload_info block (see shim/build.sh)."""
+    pinfo = image.find(b'A30P\x01\x00\x00\x00')
+    if pinfo < 0:
+        sys.exit('--shim: no A30P payload_info block found (image built without a payload?)')
+    delta, plsize = struct.unpack_from('<QQ', image, pinfo + 8)
+    blob = image[pinfo + delta: pinfo + delta + plsize]
+    assert blob[:8] == b'SWEETXNU', 'embedded blob is not a SWEETXNU payload'
+    return blob
+
+
+def assemble_sboot_entry(bin_path):
+    """Assemble tools/sboot_entry.S (SBOOT-like hostile entry) to a raw blob.
+
+    The blob is position-fixed: placed at STUB_PA, its hand-written constants
+    expect the level-1 table at STUB_PA + 0x1000, the DTB at DTB_PA and the
+    shim at SHIM_PA.
+    """
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sboot_entry.S')
+    obj = bin_path[:-4] + '.o'
+    subprocess.run(['clang', '--target=aarch64-unknown-none-elf', '-c', src, '-o', obj], check=True)
+    subprocess.run(['llvm-objcopy', '-O', 'binary', obj, bin_path], check=True)
+    os.unlink(obj)
+    blob = os.path.getsize(bin_path)
+    assert blob >= 0x1020, f'sboot entry blob too small ({blob:#x})'
+    return bin_path
+
+
+def write_png(path, raw, w=FB_W, h=FB_H, stride=FB_STRIDE):
     rows = []
-    for y in range(FB_H):
-        line = raw[y * FB_STRIDE:(y + 1) * FB_STRIDE]
-        rgb = bytearray(FB_W * 3)	# a8r8g8b8 little endian = B G R A in memory
+    for y in range(h):
+        line = raw[y * stride:(y + 1) * stride]
+        rgb = bytearray(w * 3)	# a8r8g8b8 little endian = B G R A in memory
         rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]
         rows.append(b'\0' + bytes(rgb))
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
-    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', FB_W, FB_H, 8, 2, 0, 0, 0))
+    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
     png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
     open(path, 'wb').write(png)
 
@@ -224,9 +280,17 @@ def main():
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
+    ap.add_argument('--gicv2', action='store_true',
+                    help='virt board with gic-version=2 (A30s GIC-400 kernel: 0082 compiles out GICv3)')
+    ap.add_argument('--shim', metavar='IMAGE-PAYLOAD', help='boot the REAL a30s shim (shim/out/Image-payload) instead of the stub: SBOOT-style handoff with x0 = a QEMU-generated DTB; the single positional is then OUTDIR')
+    ap.add_argument('--sboot-state', action='store_true',
+                    help='with --shim: enter the shim with MMU+caches on, dirty TLB and junked regs (SBOOT leftover state; tools/sboot_entry.S)')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--fb-dump', metavar='ADDR,SIZE', help='extra pmemsave region at stop, e.g. 0xEC000000,0x1400000 (the ADT sweet-fbcon the kernel fbcon maps)')
+    ap.add_argument('--watch', action='store_true', help='keep fb.png/adtfb.png refreshed in the out dir while the VM runs (open in an auto-reloading viewer, e.g. gwenview)')
+    ap.add_argument('--watch-int', type=float, default=1.0, help='watch refresh interval in seconds (default: 1.0)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
 
@@ -238,8 +302,17 @@ def main():
             print('[!] Optional: llvm-nm not found (needed only when using --kernel for text decoding)', file=sys.stderr)
         return 0 if ok else 1
 
-    if not a.payload or not a.outdir:
+    if a.shim:
+        # with --shim the first positional carries OUTDIR instead of a payload
+        if a.payload and not a.outdir:
+            a.outdir, a.payload = a.payload, None
+        if not a.outdir:
+            ap.error('outdir (positional) is required with --shim')
+    elif not a.payload or not a.outdir:
         ap.error('payload and outdir are required unless --check-env is specified')
+
+    if a.sboot_state and not a.shim:
+        ap.error('--sboot-state requires --shim')
 
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
@@ -250,7 +323,12 @@ def main():
     if a.kernel and not check_kernel_tools(a.kernel):
         return 1
 
-    payload = open(a.payload, 'rb').read()
+    shim_image = None
+    if a.shim:
+        shim_image = open(a.shim, 'rb').read()
+        payload = find_embedded_payload(shim_image)
+    else:
+        payload = open(a.payload, 'rb').read()
     font = None
     if a.kernel:
         symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
@@ -262,23 +340,45 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
-    phys_base, img, ba_pa, entry_pa = build_image(payload)
-    open(f'{out}/ram.bin', 'wb').write(img)
-    open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
-    print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
+    # payload header: virt_base@0x10 ... phys_base@0x38, mem_size@0x40
+    phys_base = struct.unpack_from('<Q', payload, 0x38)[0]
+    mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
+    ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
 
     mon = f'{out}/mon.sock'
     if os.path.exists(mon):
         os.unlink(mon)
-    # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
-    mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
-    ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    cmd = ['qemu-system-aarch64', '-M', f'virt,gic-version={2 if a.gicv2 else 3}', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
-           '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
-           '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
-           '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
+    if a.shim:
+        open(f'{out}/shim-image.bin', 'wb').write(shim_image)
+        open(f'{out}/payload-embedded.bin', 'wb').write(payload)
+        if a.sboot_state:
+            # SBOOT-like hostile entry: the assembled blob turns the MMU and
+            # caches on with flat tables, dirties the TLB and jumps to the
+            # shim itself. Position-fixed to STUB_PA (table at STUB_PA+0x1000).
+            entry_bin = assemble_sboot_entry(f'{out}/sboot-entry.bin')
+            print('sboot-state: shim entered with MMU+caches on, dirty TLB (tools/sboot_entry.S)', file=sys.stderr)
+        else:
+            open(f'{out}/stub.bin', 'wb').write(stub(DTB_PA, SHIM_PA))  # x0 = FDT; branch = shim entry
+            entry_bin = f'{out}/stub.bin'
+        dtb = f'{out}/virt.dtb'
+        if not os.path.exists(dtb):
+            dump_virt_dtb(dtb, a.cpu, ram_gib, a.gicv2)
+        print(f'shim={a.shim} @{SHIM_PA:#x} x0=dtb@{DTB_PA:#x} payload={len(payload):#x} phys={phys_base:#x}', file=sys.stderr)
+        cmd += ['-device', f'loader,file={out}/shim-image.bin,addr={SHIM_PA:#x},force-raw=on',
+                '-device', f'loader,file={dtb},addr={DTB_PA:#x},force-raw=on',
+                '-device', f'loader,file={entry_bin},addr={STUB_PA:#x},force-raw=on',
+                '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    else:
+        _, img, ba_pa, entry_pa = build_image(payload)
+        open(f'{out}/ram.bin', 'wb').write(img)
+        open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
+        print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
+        cmd += ['-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
+                '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
+                '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 
@@ -294,9 +394,36 @@ def main():
             return 0
 
         t0 = time.time()
+        last_refresh = 0.0
+        last_log_check = 0.0
+        spiral_halted = False
+        qlog = f'{out}/qemu.log'
         while p.poll() is None and time.time() - t0 < a.secs:
             if a.live_serial:
                 serial_pos = stream_serial_file(serial_file, serial_pos)
+            now = time.time()
+            # A guest exception storm logs GB/s into qemu.log (the qsboot
+            # run filled the whole tmpfs once). Freeze the VM at the onset:
+            # processes stop issuing, the stop-state artifacts stay intact.
+            if not spiral_halted and now - last_log_check >= 1.0:
+                last_log_check = now
+                try:
+                    if os.path.getsize(qlog) > 32 << 20:
+                        qmp(mon, 'stop')
+                        spiral_halted = True
+                        print('[!] exception storm detected: guest halted at the onset', file=sys.stderr)
+                except Exception:
+                    pass
+            if a.watch and now - last_refresh >= a.watch_int:
+                try:
+                    qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+                    write_png(f'{out}/fb.png', open(f'{out}/fb.raw', 'rb').read())
+                    qmp(mon, pmemsave=(ADT_FB, ADT_FB_STRIDE * ADT_FB_H, f'{out}/adtfb.raw'))
+                    write_png(f'{out}/adtfb.png', open(f'{out}/adtfb.raw', 'rb').read(),
+                              ADT_FB_W, ADT_FB_H, ADT_FB_STRIDE)
+                    last_refresh = time.time()
+                except Exception:
+                    pass
             time.sleep(0.2)
 
         if a.live_serial:
@@ -304,7 +431,15 @@ def main():
 
         result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
         if p.poll() is None:
-            _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+            dumps = []
+            if a.fb_dump:
+                addr_s, size_s = a.fb_dump.split(',', 1)
+                dumps.append((int(addr_s, 0), int(size_s, 0), f'{out}/adtfb.raw'))
+            _, regs, *extra = qmp(mon, 'stop', 'info registers',
+                                  *a.hmp,
+                                  pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+            for addr, size, fname in dumps:	# VM is stopped but alive here
+                qmp(mon, pmemsave=(addr, size, fname))
             open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
             p.kill()
             p.wait()

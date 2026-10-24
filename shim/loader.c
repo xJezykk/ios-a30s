@@ -309,9 +309,37 @@ const char *loader_boot(uint64_t dtb)
 	con_hex("JUMP pa", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
-	/* Everything was written with the MMU and caches off; drop any
-	 * stale I-cache lines too. */
-	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
-	((xnu_entry_t)entry_pa)(ba_pa);
+	/* P2.5 root cause, reproduced in QEMU (--sboot-state): SBOOT can enter
+	 * this shim with the MMU still on (stale tables) and/or caches running.
+	 * The XNU head builds its own page tables assuming a virgin core and
+	 * otherwise dies in a prefetch-abort loop on its own head code (FAR =
+	 * kernel head, QEMU qsboot run). Hand the core over in the state the
+	 * head expects:
+	 *   1. dc civac over everything this loader wrote (the one
+	 *      cache-coherence hazard QEMU's TCG cannot model);
+	 *   2. MMU + D/I caches off, TLB empty, I-cache invalidated. */
+	{
+		unsigned long a = (unsigned long)p->phys_base, end = (unsigned long)top;
+
+		while (a < end) {
+			__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+			a += 64;
+		}
+	}
+	__asm__ volatile(
+	    "dsb sy				\n"
+	    "mrs x16, sctlr_el1			\n"
+	    "bic x16, x16, #(1 << 0)		\n"	/* MMU off */
+	    "bic x16, x16, #(1 << 2)		\n"	/* D-cache off */
+	    "bic x16, x16, #(1 << 12)		\n"	/* I-cache off */
+	    "msr sctlr_el1, x16			\n"
+	    "dsb sy				\n"
+	    "tlbi vmalle1			\n"
+	    "ic iallu				\n"
+	    "dsb sy				\n"
+	    "isb				\n"
+	    "mov x0, %[ba]			\n"
+	    "br %[entry]			\n"
+	    :: [ba] "r"(ba_pa), [entry] "r"(entry_pa) : "memory", "x0", "x16");
 	return "xnu returned";
 }
