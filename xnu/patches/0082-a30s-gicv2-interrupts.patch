@@ -1,16 +1,29 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9..3c5ca92 100644
+index 2545cf9..ac752b7 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,9 @@
  #include <pexpert/arm64/board_config.h>
  
  #if defined(SWEET)
-+#include <pexpert/arm/protos.h> /* pe_sweet_gic_self_sgi on the GICv2 path */
++/* pexpert/arm/protos.h is not includable from IOKit C++ TUs (it fails to
++ * compile there: kern_return_t is undefined), so the GICv2 IPI helper is
++ * declared locally before its call below. */
  #include <IOKit/IOCPU.h>
  #include <IOKit/IOLib.h>
  #include <libkern/c++/OSData.h>
-@@ -209,6 +210,15 @@ SweetCPU::initCPU(bool boot)
+@@ -206,9 +209,26 @@ SweetCPU::initCPU(bool boot)
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
++#if defined(SWEET_GICV2)
++/*
++ * GIC-400 helper from pe_fiq.c, declared with C linkage to match its C
++ * definition in pexpert/arm/pe_fiq.c.
++ */
++extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
++#endif /* SWEET_GICV2 */
++
  void
  SweetCPU::signalCPU(IOCPU *target)
  {
@@ -26,7 +39,7 @@ index 2545cf9..3c5ca92 100644
  	const ml_topology_info_t *topology = ml_get_topology_info();
  	unsigned int logical = target->getCPUNumber();
  	if (logical >= topology->num_cpus) {
-@@ -227,6 +237,7 @@ SweetCPU::signalCPU(IOCPU *target)
+@@ -227,6 +247,7 @@ SweetCPU::signalCPU(IOCPU *target)
  	__builtin_arm_dsb(DSB_ISHST);
  	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
  	__builtin_arm_isb(ISB_SY);
