@@ -533,30 +533,38 @@ IONameMatch strings) lives in the ADT we feed, not in patches:
 `debug=0xc serial=3 keepsyms=1 cpus=1 -enable_kprintf_spam -noprogress
 rd=md0 ignition_level=1 wdt=-1` style; console = sweetfbcon on fb.
 
-## Flash attempt state (2026-10-23 16:30)
+## P2 payload image, first attempted flash (2026-10-24)
 
-- User approved the P1 flash (their words: "Flash it now").
-- Pre-flight halted at step 1: the phone dropped off USB before any
-  write happened — `adb devices` showed zero devices on two retries.
-  **Nothing was flashed.** The build artifacts on the PC are intact
-  (`shim/out/shim-a30s-p1.img`, 86 KB).
-- Resolved fact: `backup_samsung/boot.img` = byte-exact copy of the
-  live boot partition (37,748,736 bytes, cmp-checked; my earlier
-  "mismatch" was an 88-byte adb transport artifact on the PC dump, not
-  a real difference). It remains the Magisk-patched boot, not stock.
-- Next action on device return: (1) fresh boot dump + hash check,
-  (2) push shim img + boot backup to the phone (shim → /data/local/tmp,
-  boot restore copy → real SD card since FBE encrypts /data), (3) dd
-  the shim, readback-hash verify, (4) reboot and read the bands.
-  Only proceed when the user is watching the screen.
+- CI run 3 GREEN (run 40102410525, commit 4fc5c64; remote squash trail
+  ae046c5 -> 1bb5315 -> 4fc5c64): full xnu-8796.141.3 DEVELOPMENT.SWEET
+  kernel built and linked with our 0082 GICv2 layer after two rounds
+  (run1: pexpert/arm/protos.h kern_return_t in IOKit C++ TU; run2:
+  HAS_GIC_V3 still 1 so pe_fiq compiled the GICv3 arm and the three
+  pe_sweet_gic helpers did not exist at link; fix2 flips HAS_GIC_V3=0
+  under SWEET_GICV2 and hoists sweet_vtimer_intid out of the dead arm).
+- kernel.development.sweet sha256 09370a5876cd663d2c77deedd7f257a71e340
+  200a413015abd1ab0d0d77754bb (17,221,688 bytes, pie arm64 Mach-O).
+- mkpayload run: 16,604,944-byte payload (34 segs; header 0x2a8 seg table
+  + cmdline "debug=0xc serial=3 keepsyms=1 cpus=1"); ADT regenerated
+  fresh (random-seed differs per build, by design).
+- Boot image: shim/out/shim-a30s-p2.img, 16,728,064 bytes, sha256
+  362e1be90d6217b0d76a276bf4ceeb3c452b388951431b3d352c6c183530ece3;
+  Android boot header v1 kernel@0x10008000 2048B pages, kernel_size
+  0xff2f30; A30P\x01 info at 0x1d000 with PC-relative delta 0x20 ->
+  payload 0x1d020 (build.sh patched, loads from drifting SBOOT base).
+- Budget: 16.7 MB image vs 37,748,736-byte boot partition (~21 MB clear).
+- User says boot partition untouched since the live dump used for
+  backup_samsung/boot.img (md5 7e5c1f459204da19c12d81a267b3e1cd).
+  Flash protocol per consensus: optional read-only on-device boot hash
+  check -> adb push image + on-device hash verify -> dd -> readback
+  hash == image sha -> reboot, watch screen -> end of session dd the
+  backup back and reboot to Android.
 
-## Next up (after P1 boot report)
+## Next up (after the 2026-10-24 flash)
 
-1. GICv2 interrupt layer in XNU (replaces the port's GICv3 code).
-2. arch timer bring-up at the FDT-declared PPI (interrupt cell 9 →
-   physical NS timer, GICv2 INTID 25).
-3. DW-MMC driver for eMMC (the biggest new driver; reference: Samsung
+1. Live verification of the GICv2 path (0082): vtimer PPI 27 via
+   sleh_gicv2 branch, SGI self-signaling from SweetCPU::signalCPU.
+2. DW-MMC driver for eMMC (the biggest new driver; reference: Samsung
    GPL dw_mmc-exynos.c), then the iOS root in userdata.
-4. mkadt input pipeline for 7904 MMIO/RAM map, ADT handoff to Laun.sh.
-5. DECON/DSIM niceties (panel persistence assumptions get their real
-   answer live with the P1 boot itself).
+3. DECON/DSIM niceties (panel persistence assumptions get their real
+   answer live with the P2 boot itself).
