@@ -560,9 +560,150 @@ rd=md0 ignition_level=1 wdt=-1` style; console = sweetfbcon on fb.
   hash == image sha -> reboot, watch screen -> end of session dd the
   backup back and reboot to Android.
 
-## Next up (after the 2026-10-24 flash)
+## QEMU end-to-end round: shim E2E, SBOOT-residue repro, hardened jump (2026-10-24, offline, pre-flash)
 
-1. Live verification of the GICv2 path (0082): vtimer PPI 27 via
+- Offline boot proof: `tools/qemu-sweet.py --gicv2 --watch --fb-dump
+  0xEC000000,0x1400000` with the kernel+ADT payload painted the full
+  early + IOKit boot onto the ADT-style fbcon (platform expert,
+  AppleKeyStore/IOWatchdog/IOCoreSurfaceRoot/HID/BATTERY stubs in fork,
+  AppleCLCD start, VM bootstrap, OSLog/firehose, AMFI). Healthy-run
+  signature: qemu.log == 868 B of benign `gic_dist_writeb: Bad offset
+  a4..bf` (our GICv2 init byte-writes vs QEMU's distributor model:
+  write-ignored, boot unaffected). The kernel's fbcon console needs the
+  phone cmdline `serial=3` = SERIALMODE_OUTPUT|INPUT
+  (osfmk/console/serial_protos.h); without it disableConsoleOutput
+  stays TRUE and the screen stays mute (solves the "prints invisible"
+  mystery). Early boot needs no IOKit drivers of ours: architected
+  timer + 0082 GIC + pexpert fbcon only.
+- Shim E2E in QEMU (new `--shim APP-PAYLOAD`): the REAL shim image
+  loaded at 0x42000000 (phone SBOOT uses 0x10008000, below virt RAM
+  base; shim is position-independent: drift fix, PC-relative A30P), a
+  QEMU-dumpdtb DTB at 0x41000000 handed in x0 via a 6-instr trampoline,
+  exactly SBOOT-faithful otherwise. Result: kernel binds the shim's
+  boot_args — "iBoot version: a30s-shim", "SWEET FB: AppleCLCD 720x1560
+  stride 2880 at 0xec000000" — and boots to the same console end as the
+  stub-entry runs (qshim/, qwatch-s3/ 120 s; qlong/ 600 s).
+- 600 s run (qlong): guest healthy the whole time, zero exceptions,
+  parked at the AMFI plateau the entire window (end PC in
+  ml_get_speculative_timebase, the scheduler tick sampler). The
+  plateau is a real IOKit-side wait, not a boot death; TCG wall-clock
+  is just slow. Next offline milestone: find what IOKit waits on after
+  SWEET AMFI registration (probe run with the --gdb path).
+- P2.5 phone black screen REPRODUCED offline: new
+  `tools/sboot_entry.S` entered via `--sboot-state` emulates a hostile
+  SBOOT handoff — MAIR 0xff, TCR 0x3a20, TTBR0 flat 1 GiB blocks at
+  0x40201000, SCTLR M|C|I on, dirty TLB, junk regs, x0=DTB, br shim —
+  and the chain death-spiralled exactly like the phone: prefetch-abort
+  storm, ESR 0x24-class 0x86000005 instruction translation fault, FAR
+  = the XNU head's own code (0xc548d384), 7.4 GB qemu.log (disk full;
+  harness now storm-guards: QMP `stop` when qemu.log passes 32 MB).
+  Root cause: the shim handed XNU a core with SBOOT residue (MMU,
+  caches, TLB) while the kernel head builds tables assuming a virgin
+  core. Death was PRE-panel-paint, superseding the earlier "fbcon
+  clears screen" theory (P.206 boot-core MPIDR 0x80000100 unaffected).
+- Fix (shim/loader.c jump block): before jumping, sweep `dc civac` over
+  [phys_base, top) every 64 B (flush+clean everything the loader
+  wrote; the D-cache coherence class TCG cannot model), then dsb;
+  SCTLR M|C|I off; dsb; `tlbi vmalle1`; `ic iallu`; dsb; isb; mov x0 =
+  boot_args; br entry. The kernel head now gets the virgin core it
+  assumes.
+- Validation: rebuild + rerun --sboot-state -> survived to the AMFI
+  plateau, ZERO exceptions, qemu.log 868 B, end state identical to the
+  clean-entry run. All offline gates now green: kernel, ADT, cmdline,
+  shim handoff, hostile SBOOT entry.
+- Flash candidate rebuilt today (hardened): shim/out/shim-a30s-p2.img,
+  16,728,064 B, payload = kernel + PHONE ADT (a30s.adt), cmdline
+  "debug=0xc serial=3 keepsyms=1 cpus=1", phys_base 0xc4000000, A30P
+  info at 0x1d800 (drifted vs 0x1d000: hardened .text grew), payload
+  size 0xfd5f10, kernel_size 0xff2f30. md5 d550bd5e9b91a413c
+  d5e8d14c6b20ca5 (on-device readback compare target), sha256
+  255c896883b3d500824d994694c2749b2ac21596e66ac25c82c41803a5226303.
+  The previous (unhardened, 16:56 build) image is preserved unflashable
+  as shim-a30s-p2.STALE-unhardened.img.
+- Offline limits (proven-on-phone subjects): D-cache coherence on the
+  panel FB writes (civac sweep is the prophylactic), real Cortex-A73
+  silicon (QEMU has a72/a53/a55/a76; runs used a76), Samsung's own
+  SBOOT DTB flavor. SMP stays parked (cpus=1).
+
+## P2.6 flash + M0/M1 instrument round (2026-10-24 evening) — 16K-PAGE TCR ROOT CAUSE
+
+- P2.6 flash (hardened shim, UNpatched payload): TWRP dd, readback md5
+  `d550bd5e…` == artifact; result: console chains through the loader
+  prints to `XNU jumping` and freezes. Same silent death as P2.5, now
+  with the hardened handoff in place → the shim-side jump class exonerated.
+- M0/M1 instrument built (tools/patch_m0.py): inserts one payload seg
+  row (M0 = entry-PA batten: paints an 8-row x 256 px RED strip at
+  fb rows 1536..1543 the moment the jump lands + our stub runs), and a
+  52-B overwrite at real `__start` (M1 = 2-row x 256 px GREEN strip at
+  fb rows 1546..1547: reached the actual kernel entry). Bar geometry
+  "shorter/not reaching screen end" is BY DESIGN. Patcher header math:
+  seg table @0x2a8 (32 B/row), nsegs@0x0C, entry@0x18, adt_off@0x20,
+  kernel_end@0x30; M0 row inserted before seg 0; entry_va -> M0.
+- QEMU blocker chased for a full round and root-caused stupid-late:
+  my patcher packed nsegs at header offset 0x08 — stamping over
+  `version` (struct payload: magic[8]@0, version@0x08, nsegs@0x0C) —
+  so `loader_boot` rejected the blob with "bad payload header",
+  printed PLFAIL (overpainted), and fell into the P1 probe screen,
+  which parked at the band-1 smc and LOOKED like an instrument bug.
+  Two facts that hid it: (a) the shim boots the payload BEFORE the
+  band probes (loader_boot first; bands are only the diagnostic
+  fallback), (b) the panic block overpaints the PLFAIL evidence.
+  One-byte fix; afterwards EVERY QEMU cell green: patched payload
+  clean AND sboot-hostile entry both reach the full kernel console
+  (868 B healthy runs), 8-s bar-check run paints both bars.
+- TWRP reality notes: /data/local/tmp does NOT exist under TWRP
+  (recovery root layout); staging goes to TWRP /tmp (tmpfs). Busybox
+  dd: no `4M` suffix, no `conv=`; use bs=4194304 + explicit sync.
+- Phone flash of the instrument: /tmp/shim-a30s-p2m0.img
+  (16,728,064 B, md5 b00dfd1c23b2e10e7d2794c27b41d381), dd + readback
+  md5 equal. Note: the live partition BEFORE this round held an
+  ANDROID!-header image with md5 9c0c7e526eb80597762128f04820dab8 that
+  matches no host artifact (unidentified self-state; overwritten).
+- PHONE READING (user): red M0 strip painted, green M1 strip painted
+  (shorter + narrower, as designed), then frozen. So: jump lands, M0
+  runs, real __start executes, and the body dies BEFORE its first
+  console paint — the pre-console kernel head window, exactly the cell
+  the ladder was built to isolate; QEMU (a76) sails through it.
+- The surviving suspect was unique: the kernel is built with 16K pages
+  and the phone cores are ARMv8.0. TCR check on the CI kernel binary:
+  common_start loads the boot TCR from sysreg_restore (cpu.c sets
+  .tcr_el1 = TCR_EL1_BOOT); decoded const = 0x226511a511 → TG0 = 2 =
+  16 KB granule (TTBR0) and TG1 = 1 = 16 KB (TTBR1, INVERTED encodings
+  — my earlier "TG1=64K" misread reconciled against proc_reg.h 826..867:
+  TG0 16K=2, TG1 16K=1). 16K granule is ARMv8.2+; A73/A53 = v8.0
+  = only 4K/64K. MMU-on with a 16K TCR on a v8.0 core = every table
+  walk faults afterwards.
+- QEMU repro that promoted the theory to fact: same instrumented
+  payload, `--cpu cortex-a53` (v8.0): both bars paint, then a
+  prefetch-abort STORM (75 MB qemu.log at the 32 MB storm guard): first
+  trap ESR 0x86000005 at PHYS pc 0xc548d440 (the head's own
+  __bootstrap_pagetables territory, page-table walk gone), then the
+  head's exception vectors at 0x7487000 triple-faulting forever
+  (vector fetch itself faults translation). v8.2 a76: zero exceptions.
+- VERDICT: the phone never reached the kernel body because the head's
+  very first act — MMU on with a 16K-granule TCR — is architecturally
+  unsupported on this silicon. This retro-explains every P2.x silent
+  freeze despite a green QEMU.
+- FIX (in flight): rebuild the CI kernel with 4K pages. Knob =
+  `#define __ARM_16K_PG__ 1` in pexpert/pexpert/arm64/SWEET.h:37 →
+  proc_reg.h ARM_PGSHIFT 14→12 and TCR_TG0/TG1_GRANULE_SIZE 16K→4K
+  (lines 831/865). Ships as a NEW CI patch 0083-a30s-4k-pages.patch
+  (patch series runs 0081 upstream + 0082 GICv2 today). 4K build
+  caveat in start.s: the SWEET splash fb block maps 32 MB as ONE
+  16K-granule L2 block at 0x9c000000; in a 4K kernel an L2 block is
+  2 MB → must loop over 16 L2 entries. Binary patching stays the tool
+  for small steps, but page granularity requires the rebuild.
+- CI validation for the 4K cycle MUST include `--cpu cortex-a53`
+  full-kernel-boot: the current 16K CI kernel storms under a53 (75 MB
+  log); the 4K build has to sail (both bars + 868 B-class log) before
+  any next phone flash round.
+
+## Next up (after the P2.6 instrument round)
+
+1. 0083-a30s-4k-pages.patch authored and applied: 4K-page CI kernel
+   (SWEET.h knob + start.s splash L2 loop), CI green, --cpu
+   cortex-a53 full-boot validation, then the next flash round.
+2. Live verification of the GICv2 path (0082): vtimer PPI 27 via
    sleh_gicv2 branch, SGI self-signaling from SweetCPU::signalCPU.
 2. DW-MMC driver for eMMC (the biggest new driver; reference: Samsung
    GPL dw_mmc-exynos.c), then the iOS root in userdata.
