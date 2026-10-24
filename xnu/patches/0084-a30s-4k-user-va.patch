@@ -1,18 +1,32 @@
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index f30b793..62923ad 100644
+index 596b9e0..96d60fd 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
-@@ -347,6 +347,13 @@ ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+@@ -61,7 +61,7 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto
+ 
+ 
+ #
+@@ -351,6 +351,18 @@ ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
  #
  ARM64_PLKSEG_ADDR  =0xfffffff004004000
  ARM64_LINK_ADDR    =0xfffffff007004000
 +#
-+# 4K granule nests the commpage in a 1GB L1 block (pmap.c static_assert at
-+# pmap_insert_commpage), which must sit at/above MACH_VM_MAX_ADDRESS. The macOS
-+# 47-bit user VA limit (0x00007FFFFE000000) breaks that, so SWEET uses the
-+# non-macOS limit (0xFC0000000). (a30s patch 0084)
++# (a30s patch 0084) Do NOT use ARM_LARGE_MEMORY with 4K pages. That layout puts
++# VM_MIN_KERNEL_ADDRESS / LOW_GLOBAL_BASE_ADDRESS at -2TB and the physical
++# aperture below it, which needs a >39-bit TTBR1; the 4K pmap is L1-rooted
++# (T1SZ_BOOT 25 = top 512GB only), so those VAs are unmapped. The non-large
++# layout (BCM2837-style: kernel VA at -128GB..-16GB, low globals at -64GB)
++# fits the window, and the link bases above already sit in it. The small
++# bootstrap pool is enough: DRAM handed to XNU is only 0x31300000 bytes.
++# MACH_VM_MAX_ADDRESS: pmap.c's 4K static_assert needs the commpage nesting
++# block at/above it, so use the non-macOS limit (0xFC0000000).
 +#
-+LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1 -DSWEET_4K_USERVA=1
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1
  endif
  endif
  
@@ -29,3 +43,19 @@ index c013288..cc52d06 100644
  #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index e9df91d..645da72 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -33,7 +33,10 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
++/*
++ * (a30s patch 0084) No __ARM_PAN_AVAILABLE__: PAN is ARMv8.1, the A73/A53 are
++ * v8.0, and arm_init.c executes `msr PAN, #1` before arm_vm_init.
++ */
+ 
+ /*
+  * The Galaxy A30s (Exynos 7904) cores are Cortex-A73 + Cortex-A53 =
