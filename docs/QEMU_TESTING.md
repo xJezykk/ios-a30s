@@ -161,46 +161,64 @@ LOCKDOWN, and at entry to `bsd_init()`. In parallel, add periodic QEMU-only
 QMP register/stack snapshots or a working GDB transport to distinguish a
 moving PC from a repeated wait/loop. Run those changes only in QEMU first.
 
-The useful next milestone is to establish whether the dispatcher advances
-through EARLY_BOOT and reaches post-lockdown / BSD startup. No root filesystem was attached,
-no root device was mounted, and no intended userspace was launched. Neither
-console text nor an empty panic scan proves a complete kernel boot.
+No root filesystem was attached, no root device was mounted, and no intended
+userspace was launched. Neither console text nor an empty panic scan proves
+a complete kernel boot.
 
 ### Explicit startup trace patch
 
 Patch `xnu/patches/0087-a30s-startup-progress.patch` adds one-shot
-`SWEETTRACE: A30S_*` `printf` markers after EARLY_BOOT dispatch, after screen
-and commpage setup, after lockdown callbacks, after `machine_lockdown()`, and
-at the start of `bsd_init()`. These use the same kernel `printf`/framebuffer
-path that displayed the AMFI line. The patch changes no scheduler, interrupt,
-timer, or memory-management logic. It dry-runs cleanly against the saved
-patched XNU source tree.
+`SWEETTRACE: A30S_*` `printf` markers after EARLY_BOOT dispatch and `spllo()`,
+after screen/commpage setup, after lockdown callbacks, after
+`machine_lockdown()`, and at `bsd_init()` entry. These use the framebuffer
+`printf` path that displayed the AMFI line. The patch changes no scheduler,
+interrupt, timer, or memory-management logic.
 
-No instrumented kernel or image was built on the current Linux host: this
-project's pinned XNU build needs Xcode's `xcodebuild`, `xcrun`, and Apple `iig`
-on the macOS 14 runner; none is installed here. Therefore the existing
-probe-disabled candidate remains unchanged and is **not** instrumented. No
-QEMU run can truthfully report these new markers or repeated snapshots until
-the patch is built into a new kernel. Do not treat existing QEMU snapshots as
-validation of patch 0087.
+The Actions kernel for PR merge `bce17d818a4b748e86fff776e6fa7f4c7f1bbdb4`
+contains all five markers; its kernel SHA-256 is
+`75ad1fbf9b105b2474e9eb67cedc1adb306e6cffd317ee33bb40112e19d6171d`. The
+first built revision placed `A30S_EARLY_BOOT_DONE` before `spllo()`. Both
+direct-entry and shim/SBOOT-state QEMU runs panicked at
+`Console I/O from interrupt-disabled context @serial_console.c:168` when that
+marker called `printf`. XNU's guard rejects console I/O once startup phase is
+EARLY_BOOT while interrupts remain disabled. This locates the failure after
+the EARLY_BOOT dispatcher returned but before `spllo()` completed; it is an
+instrumentation placement bug, not a demonstrated hardware or IOKit failure.
 
-The tested CI kernel has SHA-256
-`8d181ef91cb070cd0c5a5bf3d4bd4603df9c4c91915530a2859864c0ce8edd9d`.
-Its candidate record identifies Actions merge commit
-`96aad960f7d15992ba366a4be597524f4c31de17` as merging the branch-tip commit
-`ee6552674b8c29a0195165a23c4ee87b5f7b4bed`. The local branch tip is that
-same commit, but the merge object is not in the local Git object database, so
-this session could not independently run an ancestry check. The artifact
-record/source build tree is consistent with the branch, but strict source
-ancestry remains not independently verified. The CI source includes the 4 KiB
-page setup and eMMC probe, but the QEMU payload has no
-`emmcprobe=1`, and QEMU does not model the Exynos host or phone eMMC.
+Repeated QMP samples confirmed the simulated panic state persisted: direct
+entry recorded 11 samples over 60 seconds, and shim/SBOOT-state recorded 7
+over 40 seconds. Each stayed at PC `0xfffffff0072a2bb4` with an unchanged
+stack pointer for that run. QEMU ended paused for the snapshot and the host
+harness then killed it. No trace marker was observed and
+`full_boot_verified=false`. Evidence is in the separate candidate's
+`qemu/direct/` and `qemu/shim-sboot-state/` directories. The candidate's
+outer and payload command lines omit `emmcprobe`; **do not use this failed
+candidate on hardware**.
 
-The latest recorded physical experiment remains P2.6 on 2026-10-24, using a
-16 KiB kernel that reached XNU `__start` and stopped before the console. There
-is no device boot result for this 4 KiB kernel. The QEMU runs do not establish
-physical A30s boot, hardware initialization, eMMC access, root filesystem
-support, or execution of Apple iOS components.
+The working-tree patch now moves `A30S_EARLY_BOOT_DONE` to immediately after
+`spllo()`, still after EARLY_BOOT dispatch. That correction has only passed a
+patch-application check; it has not been rebuilt or tested in QEMU. The next
+required step is a new Actions build from the corrected patch, followed by
+QEMU snapshots to check the trace sequence before any hardware decision.
+
+A separate earlier QEMU session recorded a different CI kernel
+(`8d181ef91cb070cd0c5a5bf3d4bd4603df9c4c91915530a2859864c0ce8edd9d`) and
+Actions merge `96aad960f7d15992ba366a4be597524f4c31de17`, associated with
+branch commit `ee6552674b8c29a0195165a23c4ee87b5f7b4bed`. That is historical
+evidence and is not the trace kernel analyzed above (SHA-256
+`75ad1fbf9b105b2474e9eb67cedc1adb306e6cffd317ee33bb40112e19d6171d`) or the
+current branch tip (`18b4775625a6e92df258e4faf8f82d5446f5ec55`). Each QEMU
+payload omitted `emmcprobe=1`; QEMU does not model the Exynos host or phone
+eMMC.
+
+The user subsequently reported booting the 4 KiB candidate on the physical
+A30s and seeing `SWEET AMFI: built-in interface registered`, followed by no
+new console output. The exact image on the phone and its register state were
+not independently read back. This is evidence of progress to the reported
+console line only; it does not establish that later startup completed,
+hardware initialized, eMMC was read, a root filesystem mounted, or iOS
+userspace ran. The QEMU runs do not emulate the Exynos 7904 or validate
+physical eMMC access.
 
 ## Read-only physical log collection
 

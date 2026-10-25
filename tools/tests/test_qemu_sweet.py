@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).resolve().parents[1] / 'qemu-sweet.py'
@@ -61,6 +62,14 @@ class FramebufferTests(unittest.TestCase):
         self.assertEqual(result['missing_expected_text'], [])
         self.assertFalse(result['full_boot_verified'])
 
+    def test_expected_markers_accumulate_across_snapshots(self):
+        observed = set()
+        qemu_sweet.observe_expected_text(observed, 'EARLY_BOOT_DONE\n',
+                                         ['EARLY_BOOT_DONE', 'BSD_INIT_ENTER'])
+        qemu_sweet.observe_expected_text(observed, 'BSD_INIT_ENTER\n',
+                                         ['EARLY_BOOT_DONE', 'BSD_INIT_ENTER'])
+        self.assertEqual(observed, {'EARLY_BOOT_DONE', 'BSD_INIT_ENTER'})
+
     def test_missing_expected_text_is_explicit(self):
         result = qemu_sweet.screen_result('platform expert registered\n', 0)
         qemu_sweet.apply_expected_text(result, 'platform expert registered\n', ['AMFI'])
@@ -101,6 +110,45 @@ class QMPTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(RuntimeError, 'QMP command'):
             qemu_sweet.QMPStdio(proc)
+
+    def test_cpu_snapshot_pauses_captures_stack_and_resumes(self):
+        calls = []
+
+        def fake_qmp(_mon, *commands, **_kwargs):
+            calls.append(commands)
+            if commands == ('stop', 'info status', 'info registers'):
+                return ['', 'VM status: paused', 'CPU#0 PC=1234 SP=ffff0000']
+            if commands == ('x/32gx 0xffff0000',):
+                return ['0xffff0000: 0x1 0x2']
+            if commands == ('cont',):
+                return ['']
+            self.fail(f'unexpected QMP request: {commands!r}')
+
+        with mock.patch.object(qemu_sweet, 'qmp', side_effect=fake_qmp):
+            snapshot = qemu_sweet.capture_cpu_snapshot(object(), 2, 10.5)
+
+        self.assertIn('sample 2 elapsed=10.500s', snapshot)
+        self.assertIn('SP=ffff0000', snapshot)
+        self.assertIn('0xffff0000: 0x1 0x2', snapshot)
+        self.assertEqual(calls[-1], ('cont',))
+
+    def test_cpu_snapshot_resumes_if_stack_capture_fails(self):
+        calls = []
+
+        def fake_qmp(_mon, *commands, **_kwargs):
+            calls.append(commands)
+            if commands == ('stop', 'info status', 'info registers'):
+                return ['', 'VM status: paused', 'CPU#0 PC=1234 SP=ffff0000']
+            if commands == ('x/32gx 0xffff0000',):
+                raise RuntimeError('unreadable stack')
+            if commands == ('cont',):
+                return ['']
+            self.fail(f'unexpected QMP request: {commands!r}')
+
+        with mock.patch.object(qemu_sweet, 'qmp', side_effect=fake_qmp):
+            with self.assertRaisesRegex(RuntimeError, 'unreadable stack'):
+                qemu_sweet.capture_cpu_snapshot(object(), 1, 1.0)
+        self.assertEqual(calls[-1], ('cont',))
 
 
 if __name__ == '__main__':

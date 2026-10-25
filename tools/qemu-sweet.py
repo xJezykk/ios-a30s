@@ -35,7 +35,7 @@ For A30s tests, --a30s-fb also captures and decodes the 720x1560 ADT
 framebuffer at 0xEC000000. --qmp-stdio uses QMP on standard I/O instead
 of a local Unix socket.
 """
-import argparse, hashlib, json, os, queue, shutil, socket, struct, subprocess, sys, threading, time, zlib
+import argparse, hashlib, json, os, queue, re, shutil, socket, struct, subprocess, sys, threading, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
@@ -237,6 +237,12 @@ def apply_expected_text(result, screen, expected):
     return result
 
 
+def observe_expected_text(observed, screen, expected):
+    """Accumulate expected strings observed across several screen snapshots."""
+    observed.update(item for item in expected if item in screen)
+    return observed
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as source:
@@ -320,6 +326,22 @@ def qmp(sock_path, *cmds, pmemsave=None):
     return out
 
 
+def capture_cpu_snapshot(mon, index, elapsed):
+    """Pause briefly and capture a consistent register set plus stack words."""
+    _, status, registers = qmp(mon, 'stop', 'info status', 'info registers')
+    try:
+        match = re.search(r'\bSP=([0-9a-fA-F]+)', registers)
+        if not match:
+            raise RuntimeError('QEMU info registers output has no SP value')
+        sp = int(match.group(1), 16)
+        stack, = qmp(mon, f'x/32gx {sp:#x}')
+    finally:
+        qmp(mon, 'cont')
+    return (f'=== sample {index} elapsed={elapsed:.3f}s ===\n'
+            f'{status.strip()}\n{registers.rstrip()}\n'
+            f'(qemu) x/32gx {sp:#x}\n{stack.rstrip()}\n')
+
+
 def stream_serial_file(serial_path, file_pos, out_stream=sys.stdout):
     """Read newly appended content from serial.txt and write directly to stream."""
     if not os.path.exists(serial_path):
@@ -372,6 +394,8 @@ def main():
                     help='capture/decode A30s ADT fbcon at 0xEC000000 (720x1560)')
     ap.add_argument('--watch', action='store_true', help='keep fb.png/adtfb.png refreshed in the out dir while the VM runs (open in an auto-reloading viewer, e.g. gwenview)')
     ap.add_argument('--watch-int', type=float, default=1.0, help='watch refresh interval in seconds (default: 1.0)')
+    ap.add_argument('--snapshot-interval', type=float, default=0,
+                    help='pause and save CPU registers plus 32 stack words at this interval (default: disabled)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
 
@@ -401,6 +425,8 @@ def main():
         ap.error('--a30s-fb requires --kernel for font-based console decoding')
     if a.fail_on_missing_text and not a.expect_text:
         ap.error('--fail-on-missing-text requires at least one --expect-text')
+    if a.snapshot_interval < 0:
+        ap.error('--snapshot-interval must be non-negative')
     if a.expect_text and not a.kernel:
         ap.error('--expect-text requires --kernel')
 
@@ -498,6 +524,12 @@ def main():
         t0 = time.time()
         last_refresh = 0.0
         last_log_check = 0.0
+        next_cpu_snapshot = t0 + a.snapshot_interval if a.snapshot_interval else 0.0
+        cpu_snapshot_count = 0
+        cpu_snapshot_path = f'{out}/cpu-snapshots.txt'
+        console_marker_path = f'{out}/console-markers.txt'
+        observed_expected_text = set()
+        console_watch_snapshot_count = 0
         spiral_halted = False
         qlog = f'{out}/qemu.log'
         while p.poll() is None and time.time() - t0 < a.secs:
@@ -516,13 +548,37 @@ def main():
                         print('[!] exception storm detected: guest halted at the onset', file=sys.stderr)
                 except Exception:
                     pass
+            if (a.snapshot_interval and not spiral_halted
+                    and now >= next_cpu_snapshot):
+                elapsed = now - t0
+                try:
+                    snapshot = capture_cpu_snapshot(mon, cpu_snapshot_count + 1, elapsed)
+                    with open(cpu_snapshot_path, 'a') as snapshots:
+                        snapshots.write(snapshot)
+                    cpu_snapshot_count += 1
+                except Exception as e:
+                    print(f'[!] CPU snapshot failed: {e}', file=sys.stderr)
+                next_cpu_snapshot = now + a.snapshot_interval
             if a.watch and now - last_refresh >= a.watch_int:
                 try:
                     qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
                     write_png(f'{out}/fb.png', open(f'{out}/fb.raw', 'rb').read())
                     qmp(mon, pmemsave=(ADT_FB, ADT_FB_STRIDE * ADT_FB_H, f'{out}/adtfb.raw'))
-                    write_png(f'{out}/adtfb.png', open(f'{out}/adtfb.raw', 'rb').read(),
-                              ADT_FB_W, ADT_FB_H, ADT_FB_STRIDE)
+                    adt_raw = open(f'{out}/adtfb.raw', 'rb').read()
+                    write_png(f'{out}/adtfb.png', adt_raw, ADT_FB_W, ADT_FB_H,
+                              ADT_FB_STRIDE)
+                    console_watch_snapshot_count += 1
+                    if font is not None and a.expect_text:
+                        screen, _ = decode_screen(adt_raw, font, ADT_FB_W,
+                                                  ADT_FB_H, ADT_FB_STRIDE)
+                        previous = set(observed_expected_text)
+                        observe_expected_text(observed_expected_text, screen,
+                                              a.expect_text)
+                        newly_seen = sorted(observed_expected_text - previous)
+                        if newly_seen:
+                            with open(console_marker_path, 'a') as marker_log:
+                                marker_log.write(
+                                    f'{now - t0:.3f}s: ' + ' | '.join(newly_seen) + '\n')
                     last_refresh = time.time()
                 except Exception:
                     pass
@@ -535,7 +591,9 @@ def main():
                   'full_boot_verified': False}
         execution = {'qemu_returncode_before_harness_stop': p.returncode,
                      'stopped_by_harness': False, 'guest_was_paused': False,
-                     'requested_seconds': a.secs, 'elapsed_seconds': round(time.time() - t0, 3)}
+                     'requested_seconds': a.secs, 'elapsed_seconds': round(time.time() - t0, 3),
+                     'cpu_snapshot_interval_seconds': a.snapshot_interval,
+                     'cpu_snapshot_count': cpu_snapshot_count}
         if p.poll() is None:
             dumps = []
             if a.fb_dump:
@@ -575,12 +633,27 @@ def main():
                 result = screen_result(screen, unknown)
                 apply_expected_text(result, screen, a.expect_text)
                 result['console_source'] = 'A30s ADT framebuffer 0xEC000000 (720x1560)'
+                observe_expected_text(observed_expected_text, screen,
+                                      a.expect_text)
             os.unlink(f'{out}/fb.raw')
         else:
             print(f'qemu exited early: {p.returncode}', file=sys.stderr)
 
         open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
+        if a.expect_text:
+            result['expected_text'] = a.expect_text
+            result['observed_expected_text'] = sorted(observed_expected_text)
+            result['missing_expected_text'] = [item for item in a.expect_text
+                                               if item not in observed_expected_text]
+            result['markers_satisfied'] = not result['missing_expected_text']
+            result['full_boot_verified'] = False
+            open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
+        execution['console_watch_snapshot_count'] = console_watch_snapshot_count
         outputs = ['result.json', 'regs.txt', 'qemu.log', 'serial.txt', 'fb.png', 'fb.txt']
+        if os.path.isfile(cpu_snapshot_path):
+            outputs.append('cpu-snapshots.txt')
+        if os.path.isfile(console_marker_path):
+            outputs.append('console-markers.txt')
         if a.a30s_fb:
             outputs += ['adtfb.png', 'adtfb.txt']
         artifact_hashes = {name: sha256_file(f'{out}/{name}')

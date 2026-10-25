@@ -1,14 +1,14 @@
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -696,6 +696,7 @@
- 	 * interrupts or preemption enabled may begin enforcement.
- 	 */
- 	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
+@@ -702,6 +702,7 @@
+ 	ml_spin_debug_clear_self();
+ #endif
+ 	(void) spllo();         /* Allow interruptions */
 +	printf("SWEETTRACE: A30S_EARLY_BOOT_DONE\n");
  
- #if SCHED_HYGIENE_DEBUG
- 	// Reset interrupts masked timeout before we enable interrupts
+ 	/*
+ 	 * This will start displaying progress to the user, start as early as possible
 @@ -713,6 +714,7 @@
  	 */
  	vm_commpage_init();
