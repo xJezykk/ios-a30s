@@ -74,20 +74,20 @@ jobs:
           PY
           grep -F 'XNU_VERSION="${XNU_VERSION:-$(curl -s $RELEASE_URL' dxb/build.sh
 
-          # libfirehose_kernel is a separate Xcode build: its arm64 default
-          # otherwise follows the macOS runner CPU. Build only the kernel's
-          # arm64 slice and pass the same baseline ISA explicitly.
+          # libfirehose_kernel is a separate Xcode build. Build only its arm64
+          # slice, use XNU's freestanding stdatomic.h (the SDK header is not
+          # visible with -nostdinc), and constrain codegen to ARMv8-A.
           python3 - <<'PY'
           from pathlib import Path
           p = Path("dxb/build.sh")
           s = p.read_text()
           old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
-          new = 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a+crypto"'
+          new = 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -march=armv8-a+crypto"'
           if s.count(old) != 1:
               raise SystemExit("pinned build.sh libfirehose target changed; refusing an unverified edit")
           p.write_text(s.replace(old, new))
           PY
-          grep -F 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a+crypto"' dxb/build.sh
+          grep -F 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -march=armv8-a+crypto"' dxb/build.sh
           ls dxb/patches | wc -l
 
       - name: Install dependencies and select Xcode
@@ -170,13 +170,15 @@ jobs:
           march = [i for i, arg in enumerate(firehose) if arg.startswith("-march=")]
           target = next((firehose[i + 1] for i, arg in enumerate(firehose[:-1]) if arg == "-target"), "")
           target_pos = next((i for i, arg in enumerate(firehose[:-1]) if arg == "-target"), -1)
+          xnu_std_headers = next((arg[2:] for arg in firehose if arg.startswith("-I") and arg.endswith("/xnu/EXTERNAL_HEADERS")), "")
           if (target != "arm64-apple-macos14.0" or not march
+                  or not xnu_std_headers
                   or firehose[march[-1]] != "-march=armv8-a+crypto"
                   or march[-1] < target_pos
                   or any("+lse" in arg.lower() for arg in firehose)):
               raise SystemExit("libfirehose arm64 compile is not constrained to ARMv8-A")
           print(f"verified {len(commands)} SWEET commands apply ARMv8-A after -arch")
-          print("verified libfirehose arm64 compile uses ARMv8-A")
+          print("verified libfirehose arm64 compile uses XNU stdatomic headers and ARMv8-A")
           PY
           test -s dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
 
@@ -282,10 +284,16 @@ jobs:
           SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tree_paths=()
+          for path in build/xnu.obj fakeroot/usr/local/include xnu; do
+            if [ -e "dxb/$path" ]; then
+              tree_paths+=("$path")
+            fi
+          done
           tar czf buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C dxb "${tree_paths[@]}" \
             -C .. sdk-kernel-platform
           ls -la buildtree.tgz
 
