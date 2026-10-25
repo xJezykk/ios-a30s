@@ -32,7 +32,6 @@ index 596b9e0..96d60fd 100644
  endif
 
 diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
-index 182b44a..1111111 100644
 --- a/osfmk/arm/commpage/commpage_asm.s
 +++ b/osfmk/arm/commpage/commpage_asm.s
 @@ -272,7 +272,16 @@ _pfz_trylock_and_enqueue:
@@ -87,10 +86,13 @@ index c013288..cc52d06 100644
  #else
  #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
 diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
-index 182b44a..1111111 100644
 --- a/osfmk/kern/zalloc.c
 +++ b/osfmk/kern/zalloc.c
-@@ -163,7 +163,10 @@
+@@ -160,12 +160,15 @@
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+-
++
 -#if XNU_PLATFORM_MacOSX
 -#define ZONE_MAP_MAX            (32ULL << 30)
 -#define ZONE_MAP_VA_SIZE        (128ULL << 30)
@@ -108,6 +110,9 @@ index 182b44a..1111111 100644
 +#define ZONE_MAP_MAX            (8ULL << 30)
 +#define ZONE_MAP_VA_SIZE        (24ULL << 30)
 +#endif /* SWEET_4K_USERVA || !XNU_PLATFORM_MacOSX */
+-
++
+ __enum_closed_decl(zm_len_t, uint16_t, {
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index e9df91d..645da72 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
