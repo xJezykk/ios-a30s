@@ -27,6 +27,7 @@
  */
 #include "a30s.h"
 #include "console.h"
+#include "fdt.h"
 #include "loader.h"
 
 #define BOOT_LINE_LENGTH	608
@@ -130,14 +131,27 @@ static int name_eq(const char *a, const char *b)
 static int fdt_chosen_u64(uintptr_t dtb, const char *want, uint64_t *out)
 {
 	uintptr_t stru, strs, p;
+	uintptr_t end;
 	int depth = 0, in_chosen = 0, root_seen = 0;
 
 	if (LD_BE32(dtb) != FDT_MAGIC)
 		return 0;
-	stru = dtb + LD_BE32(dtb + 8);
+	uint32_t total = LD_BE32(dtb + 4);
+	if (total < 40 || total > 0x1000000)
+		return 0;
+	uint32_t off_struct = LD_BE32(dtb + 8);
+	uint32_t size_struct = LD_BE32(dtb + 36);
+	if (off_struct > total || size_struct > total - off_struct)
+		return 0;
+	stru = dtb + off_struct;
+	end = stru + size_struct;
 	strs = dtb + LD_BE32(dtb + 12);
+	if (stru < dtb || strs < dtb || stru > end || strs >= dtb + total)
+		return 0;
 	p = stru;
 	for (;;) {
+		if (p > end || end - p < 4)
+			return 0;
 		uint32_t tok = LD_BE32(p);
 
 		p += 4;
@@ -147,14 +161,15 @@ static int fdt_chosen_u64(uintptr_t dtb, const char *want, uint64_t *out)
 			 * a PROP token */
 			if (!root_seen) {
 				root_seen = 1;
+				p = fdt_skip_node_name(p, end);
+				if (!p)
+					return 0;
 				break;
 			}
 			const char *nmp = (const char *)p;
-			uintptr_t nq = p;
-
-			while (*(const volatile char *)nq)
-				nq++;
-			p = (nq + 4) & ~(uintptr_t)3;
+			p = fdt_skip_node_name(p, end);
+			if (!p)
+				return 0;
 			depth++;
 			in_chosen = depth == 1 && name_eq(nmp, "chosen");
 			break;

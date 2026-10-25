@@ -32,6 +32,7 @@
  */
 
 #include "console.h"
+#include "fdt.h"
 #include "loader.h"
 
 #define GICD_BASE	0x12301000UL	/* fdt gic node: GIC-400 */
@@ -128,8 +129,16 @@ static int addr_ok(uint64_t a, uint64_t len)
 static void parse_cpus(struct fdt_info *fi)
 {
 	uintptr_t s11 = fi->dtb;
-	uintptr_t stru = s11 + rd32be(s11 + 8);
+	uint32_t off_struct = rd32be(s11 + 8);
+	uint32_t size_struct = rd32be(s11 + 36);
+	uintptr_t stru;
 	uintptr_t strs = s11 + rd32be(s11 + 12);
+	uintptr_t end;
+	if (off_struct > fi->totalsize ||
+	    size_struct > fi->totalsize - off_struct)
+		return;
+	stru = s11 + off_struct;
+	end = stru + size_struct;
 	uintptr_t p = stru;
 	int depth = 0, in_cpus = 0, in_cpu = 0;
 	int root_seen = 0;
@@ -137,6 +146,8 @@ static void parse_cpus(struct fdt_info *fi)
 
 	fi->ncpu = 0;
 	for (;;) {
+		if (p > end || end - p < 4)
+			return;
 		uint32_t tok = rd32be(p);
 		p += 4;
 		switch (tok) {
@@ -146,13 +157,15 @@ static void parse_cpus(struct fdt_info *fi)
 			 * cpu-at nodes at depth 2. */
 			if (!root_seen) {
 				root_seen = 1;
+				p = fdt_skip_node_name(p, end);
+				if (!p)
+					return;
 				break;
 			}
 			const char *nmp = (const char *)p;
-			uintptr_t nq = p;
-			while (*(const volatile char *)nq)
-				nq++;
-			p = (nq + 4) & ~(uintptr_t)3;
+			p = fdt_skip_node_name(p, end);
+			if (!p)
+				return;
 			depth++;
 			if (depth == 1 && !in_cpus && nmp[0] == 'c' &&
 			    nmp[1] == 'p' && nmp[2] == 'u' && nmp[3] == 's' &&
