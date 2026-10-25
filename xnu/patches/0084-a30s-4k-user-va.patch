@@ -26,8 +26,8 @@ index 596b9e0..96d60fd 100644
 +# MACH_VM_MAX_ADDRESS: pmap.c's 4K static_assert needs the commpage nesting
 +# block at/above it, so use the non-macOS limit (0xFC0000000).
 +#
-+# Append the baseline ISA here because CFLAGS_ARM64 expands this after -arch.
-+LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1 -march=armv8-a+crypto
++# Set the baseline CPU here because CFLAGS_ARM64 expands this after -arch.
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1 -mcpu=cortex-a53+crypto
  endif
  endif
 

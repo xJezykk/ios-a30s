@@ -75,19 +75,19 @@ jobs:
           grep -F 'XNU_VERSION="${XNU_VERSION:-$(curl -s $RELEASE_URL' dxb/build.sh
 
           # libfirehose_kernel is a separate Xcode build. Build only its arm64
-          # slice, use XNU's freestanding stdatomic.h (the SDK header is not
-          # visible with -nostdinc), and constrain codegen to ARMv8-A.
+          # slice; it is kernel code, so make the compile freestanding to use
+          # XNU's C11 atomic definitions, and target the lowest common CPU core.
           python3 - <<'PY'
           from pathlib import Path
           p = Path("dxb/build.sh")
           s = p.read_text()
           old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
-          new = 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -march=armv8-a+crypto"'
+          new = 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -I${WORK_DIR}/xnu/bsd -ffreestanding -mcpu=cortex-a53+crypto"'
           if s.count(old) != 1:
               raise SystemExit("pinned build.sh libfirehose target changed; refusing an unverified edit")
           p.write_text(s.replace(old, new))
           PY
-          grep -F 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -march=armv8-a+crypto"' dxb/build.sh
+          grep -F 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -I${WORK_DIR}/xnu/bsd -ffreestanding -mcpu=cortex-a53+crypto"' dxb/build.sh
           ls dxb/patches | wc -l
 
       - name: Install dependencies and select Xcode
@@ -120,8 +120,39 @@ jobs:
           test "$(git -C dxb/xnu describe --tags --exact-match)" = "$XNU_VERSION"
           test "$(git -C dxb/xnu rev-parse HEAD)" = "$(git -C dxb/xnu rev-parse "$XNU_VERSION^{commit}")"
           test "$(git -C dxb/xnu rev-parse HEAD)" = "$XNU_COMMIT"
+          # Check the selected Xcode driver's effective target and atomic codegen,
+          # not just the presence of a target flag in the build command line.
+          clang=$(xcrun --find clang)
+          driver_args=$("$clang" -target arm64-apple-macos14.0 -mcpu=cortex-a53+crypto -### -c -x c /dev/null 2>&1)
+          printf '%s\n' "$driver_args" | grep -F '"-target-cpu" "cortex-a53"'
+          if printf '%s\n' "$driver_args" | grep -F '"-target-feature" "+lse"'; then
+            echo 'Xcode clang enables LSE for the Cortex-A53 target' >&2
+            exit 1
+          fi
+          cat > atomic-target-check.c <<'EOF'
+          #include <stdatomic.h>
+          int atomic_increment(_Atomic(int) *p) {
+            return atomic_fetch_add_explicit(p, 1, memory_order_relaxed);
+          }
+          EOF
+          "$clang" -target arm64-apple-macos14.0 -DKERNEL=1 -ffreestanding \
+            -I dxb/xnu/EXTERNAL_HEADERS -I dxb/xnu/bsd -mcpu=cortex-a53+crypto \
+            -O2 -S -o atomic-target-check.s atomic-target-check.c
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          lse = re.compile(r"^(?:ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|cas|casp|swp)(?:b|h)?(?:a|l|al)?$", re.I)
+          found = []
+          for line in Path("atomic-target-check.s").read_text().splitlines():
+              match = re.match(r"^\s*([A-Za-z][A-Za-z0-9.]*)\s", line)
+              if match and lse.fullmatch(match.group(1)):
+                  found.append((match.group(1), line.strip()))
+          if found:
+              raise SystemExit("Cortex-A53 atomic smoke test emitted LSE: " + repr(found))
+          print("verified Xcode Cortex-A53 atomic codegen contains no LSE instructions")
+          PY
           grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET' dxb/xnu/makedefs/MakeInc.def
-          grep -F 'LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1 -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1 -mcpu=cortex-a53+crypto' dxb/xnu/makedefs/MakeInc.def
           grep -F '&& !defined(SWEET_4K_USERVA)' dxb/xnu/osfmk/mach/arm/vm_param.h
           if grep -E '^[[:space:]]*#define[[:space:]]+__ARM_PAN_AVAILABLE__([[:space:]]|$)' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
             echo 'Patch 0084 did not remove the SWEET PAN feature declaration' >&2
@@ -152,33 +183,35 @@ jobs:
               selectors = [arg for arg in args if arg.startswith(("-march=", "-mcpu="))]
               if selectors:
                   arch_positions = [i for i, arg in enumerate(args) if arg == "-arch"]
-                  march_positions = [i for i, arg in enumerate(args) if arg.startswith("-march=")]
-                  commands.append((selectors[-1], args, arch_positions, march_positions))
+                  selector_positions = [i for i, arg in enumerate(args) if arg.startswith(("-march=", "-mcpu="))]
+                  commands.append((selectors[-1], args, arch_positions, selector_positions))
           if not commands:
               raise SystemExit("no verbose SWEET clang compile commands found in build log")
-          bad = [(selector, args) for selector, args, arch_pos, march_pos in commands
-                 if selector != "-march=armv8-a+crypto"
+          bad = [(selector, args) for selector, args, arch_pos, selector_pos in commands
+                 if selector != "-mcpu=cortex-a53+crypto"
                  or any("+lse" in arg.lower() for arg in args)
-                 or not arch_pos or not march_pos or march_pos[-1] < arch_pos[-1]]
+                 or not arch_pos or not selector_pos or selector_pos[-1] < arch_pos[-1]]
           if bad:
               for selector, args in bad[:10]:
                   print("unexpected compiler target:", selector, " ".join(args))
-              raise SystemExit("SWEET compiler command does not apply ARMv8-A after -arch or enables LSE")
+              raise SystemExit("SWEET compiler command does not apply the Cortex-A53 target after -arch or enables LSE")
           if len(firehose_commands) != 1:
               raise SystemExit(f"expected one arm64 firehose_buffer.c compile, found {len(firehose_commands)}")
           firehose = firehose_commands[0]
-          march = [i for i, arg in enumerate(firehose) if arg.startswith("-march=")]
+          target_cpu = [i for i, arg in enumerate(firehose) if arg.startswith(("-march=", "-mcpu="))]
           target = next((firehose[i + 1] for i, arg in enumerate(firehose[:-1]) if arg == "-target"), "")
           target_pos = next((i for i, arg in enumerate(firehose[:-1]) if arg == "-target"), -1)
           xnu_std_headers = next((arg[2:] for arg in firehose if arg.startswith("-I") and arg.endswith("/xnu/EXTERNAL_HEADERS")), "")
-          if (target != "arm64-apple-macos14.0" or not march
-                  or not xnu_std_headers
-                  or firehose[march[-1]] != "-march=armv8-a+crypto"
-                  or march[-1] < target_pos
+          xnu_bsd_headers = next((arg[2:] for arg in firehose if arg.startswith("-I") and arg.endswith("/xnu/bsd")), "")
+          if (target != "arm64-apple-macos14.0" or not target_cpu
+                  or not xnu_std_headers or not xnu_bsd_headers
+                  or "-ffreestanding" not in firehose
+                  or firehose[target_cpu[-1]] != "-mcpu=cortex-a53+crypto"
+                  or target_cpu[-1] < target_pos
                   or any("+lse" in arg.lower() for arg in firehose)):
-              raise SystemExit("libfirehose arm64 compile is not constrained to ARMv8-A")
-          print(f"verified {len(commands)} SWEET commands apply ARMv8-A after -arch")
-          print("verified libfirehose arm64 compile uses XNU stdatomic headers and ARMv8-A")
+              raise SystemExit("libfirehose arm64 compile is not constrained to Cortex-A53")
+          print(f"verified {len(commands)} SWEET commands apply Cortex-A53 after -arch")
+          print("verified libfirehose arm64 compile is freestanding and targets Cortex-A53")
           PY
           test -s dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
 
@@ -267,7 +300,7 @@ jobs:
           arch_config=${ARCH_CONFIG}
           machine_config=${MACHINE_CONFIG}
           applied_a30s_patch=0084-a30s-4k-user-va.patch
-          verified_sweet_arch_flags=-march=armv8-a+crypto
+          verified_sweet_arch_flags=-mcpu=cortex-a53+crypto
           EOF
 
       - name: Upload XNU build log
