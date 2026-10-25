@@ -1,0 +1,11 @@
+{
+  "status": "no_panic_observed",
+  "unknown_glyphs": 0,
+  "snapshot_only": true,
+  "observed_stage": "framebuffer_snapshot",
+  "full_boot_verified": false,
+  "expected_text": [],
+  "missing_expected_text": [],
+  "markers_satisfied": true,
+  "console_source": "A30s ADT framebuffer 0xEC000000 (720x1560)"
+}

@@ -1,0 +1,79 @@
+{
+  "mode": "direct_entry",
+  "simulated": true,
+  "branch_head": "ee6552674b8c29a0195165a23c4ee87b5f7b4bed",
+  "qemu_version": "QEMU emulator version 11.1.2",
+  "qemu_command": [
+    "qemu-system-aarch64",
+    "-M",
+    "virt,gic-version=2",
+    "-accel",
+    "tcg",
+    "-cpu",
+    "cortex-a53",
+    "-smp",
+    "1",
+    "-m",
+    "4G",
+    "-serial",
+    "file:/tmp/ios-a30s-qemu-20261025/direct/serial.txt",
+    "-d",
+    "int,guest_errors,unimp",
+    "-D",
+    "/tmp/ios-a30s-qemu-20261025/direct/qemu.log",
+    "-no-reboot",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-qmp",
+    "stdio",
+    "-device",
+    "loader,file=/tmp/ios-a30s-qemu-20261025/direct/ram.bin,addr=0xc4000000,force-raw=on",
+    "-device",
+    "loader,file=/tmp/ios-a30s-qemu-20261025/direct/stub.bin,addr=0x40200000,force-raw=on",
+    "-device",
+    "loader,addr=0x40200000,cpu-num=0"
+  ],
+  "machine": "virt,gic-version=2",
+  "accelerator": "tcg",
+  "cpu": "cortex-a53",
+  "input_sha256": {
+    "/tmp/ios-a30s-qemu.VnFE11/a30s-qemu.payload": "717105b53712b6584a7740fbe27d0063a74b8c39b2ab0029b8528cea6ec7db20",
+    "/home/kotorola/iOS na Zjebsungu/a30s-emmc-probe-boot-96aad960/kernel.development.sweet": "8d181ef91cb070cd0c5a5bf3d4bd4603df9c4c91915530a2859864c0ce8edd9d"
+  },
+  "execution": {
+    "qemu_returncode_before_harness_stop": null,
+    "stopped_by_harness": true,
+    "guest_was_paused": true,
+    "requested_seconds": 30.0,
+    "elapsed_seconds": 30.017,
+    "guest_status_at_snapshot": "VM status: paused",
+    "harness_stop_signal": "SIGKILL after snapshot; not a guest shutdown"
+  },
+  "result": {
+    "status": "no_panic_observed",
+    "unknown_glyphs": 0,
+    "snapshot_only": true,
+    "observed_stage": "framebuffer_snapshot",
+    "full_boot_verified": false,
+    "expected_text": [
+      "VM bootstrap done",
+      "SWEET AMFI: built-in interface registered"
+    ],
+    "missing_expected_text": [],
+    "markers_satisfied": true,
+    "console_source": "A30s ADT framebuffer 0xEC000000 (720x1560)"
+  },
+  "harness_exitcode": 0,
+  "artifact_sha256": {
+    "result.json": "343152b3403e364d115dbf7a6eea7de9434a7f0b9d40be97e9df20c4c5c069f0",
+    "regs.txt": "85222a04012b947f09af28351a8d19be842422c82da97d7e5f0c53065cfb4aa4",
+    "qemu.log": "1928a65814f6c29aad26de391d622872dd19f53581a4e215b239e5192e082dd6",
+    "serial.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "fb.png": "db7f11bdb9f7a1c43b602dea1f17fcf7ecd470b571531b3b7507545abaaf3d1a",
+    "fb.txt": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "adtfb.png": "d18b16860848c4d8ef7e7bb790848aaaab044261883566566b18533cbb8f3271",
+    "adtfb.txt": "842a789969c286558f3849206bd28e88f00b17ffd8fb5bc6ec886aa6a7466b8e"
+  }
+}

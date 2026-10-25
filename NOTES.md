@@ -583,12 +583,15 @@ rd=md0 ignition_level=1 wdt=-1` style; console = sweetfbcon on fb.
   boot_args — "iBoot version: a30s-shim", "SWEET FB: AppleCLCD 720x1560
   stride 2880 at 0xec000000" — and boots to the same console end as the
   stub-entry runs (qshim/, qwatch-s3/ 120 s; qlong/ 600 s).
-- 600 s run (qlong): guest healthy the whole time, zero exceptions,
-  parked at the AMFI plateau the entire window (end PC in
-  ml_get_speculative_timebase, the scheduler tick sampler). The
-  plateau is a real IOKit-side wait, not a boot death; TCG wall-clock
-  is just slow. Next offline milestone: find what IOKit waits on after
-  SWEET AMFI registration (probe run with the --gdb path).
+- 600 s run (qlong): the historical run note recorded zero exceptions and
+  an end-of-run PC in ml_get_speculative_timebase. This was initially
+  interpreted as a persistent IOKit wait. Follow-up source inspection and a
+  separate QEMU stack snapshot show that this function is a fast CNTVCT_EL0
+  read/retry helper, called from interrupt-masking scheduler-hygiene
+  timestamp code in that snapshot. A single final PC is not proof of a wait
+  or continuous stalling. The old qlong raw registers/stack and exact payload
+  were not retained, so its state cannot be reconstructed. See
+  docs/QEMU_TESTING.md and docs/evidence/qemu-2026-10-25/amfi-stack/.
 - P2.5 phone black screen REPRODUCED offline: new
   `tools/sboot_entry.S` entered via `--sboot-state` emulates a hostile
   SBOOT handoff — MAIR 0xff, TCR 0x3a20, TTBR0 flat 1 GiB blocks at

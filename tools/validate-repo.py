@@ -5,12 +5,15 @@
 
 Checks:
   1. Patch sequence in xnu/patches/:
-     - Sequential numbering starting at 0001 with no duplicates or gaps.
+     - Sequential numbering with no duplicates or gaps. A series may start
+       above 0001 when upstream patches are fetched separately by CI.
      - Patch files are non-empty and have valid unified diff markers.
   2. Python script syntax:
      - All tools/*.py compile cleanly via py_compile.
   3. Shell script syntax:
      - All tools/*.sh, shim/*.sh, and xnu/patches/*.sh pass bash -n check.
+  4. Host regression tests:
+     - tools/tests/*.py run with unittest discovery.
 """
 import argparse, glob, os, py_compile, re, subprocess, sys
 
@@ -54,16 +57,19 @@ def validate_patches(verbose=False):
             if not ('--- ' in head or 'diff ' in head or 'Index:' in head):
                 errors.append(f"Patch missing standard diff header: {fname}")
 
-    # Check contiguous sequence
+    # Check only the locally maintained sequence. This repository carries
+    # project patches 0082+; .github/workflows/xnu.yml fetches upstream
+    # patches 0001-0081 separately before applying this directory.
     if seen_numbers:
         sorted_nums = sorted(seen_numbers.keys())
-        expected = 1
+        expected = sorted_nums[0]
+        first_number = expected
+        last_number = expected
         for num in sorted_nums:
             if num != expected:
                 errors.append(f"Gap in patch sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
-                expected = num + 1
-            else:
-                expected += 1
+            expected = num + 1
+            last_number = num
 
     if errors:
         print(red(f"[-] Patch validation failed with {len(errors)} error(s):"))
@@ -71,7 +77,7 @@ def validate_patches(verbose=False):
             print(f"    - {err}")
         return False
 
-    print(green(f"[✓] Validated {len(patch_files)} patches (0001-{len(patch_files):04d} contiguous, format OK)"))
+    print(green(f"[✓] Validated {len(patch_files)} local patches ({first_number:04d}-{last_number:04d} contiguous, format OK)"))
     return True
 
 
@@ -125,6 +131,22 @@ def validate_shell_scripts(verbose=False):
     return True
 
 
+def validate_host_tests():
+    tests_dir = os.path.join(REPO_ROOT, 'tools/tests')
+    if not os.path.isdir(tests_dir) or not glob.glob(os.path.join(tests_dir, 'test_*.py')):
+        print(green("[✓] No host regression tests configured"))
+        return True
+    result = subprocess.run(
+        [sys.executable, '-m', 'unittest', 'discover', '-s', tests_dir, '-v'],
+        cwd=REPO_ROOT,
+    )
+    if result.returncode:
+        print(red("[-] Host regression tests failed"))
+        return False
+    print(green("[✓] Host regression tests passed"))
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description="Validate repository integrity, patches, and scripts.")
     ap.add_argument('-v', '--verbose', action='store_true', help='Show detailed per-file output')
@@ -134,8 +156,9 @@ def main():
     ok_patches = validate_patches(a.verbose)
     ok_python = validate_python_scripts(a.verbose)
     ok_shell = validate_shell_scripts(a.verbose)
+    ok_tests = validate_host_tests()
 
-    if ok_patches and ok_python and ok_shell:
+    if ok_patches and ok_python and ok_shell and ok_tests:
         print(bold(green("\nAll repository integrity checks PASSED successfully!")))
         return 0
     else:

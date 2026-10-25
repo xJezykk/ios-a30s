@@ -1,0 +1,3 @@
+QEMU-specific ADT: ../amfi-stack/INPUTS.txt (same ADT hash)
+Payload SHA-256: d715b518730d3dde27775e0dd8d51bf249a23e8cbad10399a3f0eb29f375065d
+Built by tools/mkpayload.py from the kernel above with startup_debug=0x1.

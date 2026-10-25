@@ -2,6 +2,7 @@
 """Boot a SWEETXNU payload (tools/mkpayload.py) in QEMU's virt board.
 
   qemu-sweet.py PAYLOAD OUTDIR [--secs N] [--gdb] [--live-serial] [--watch]
+      [--qmp-stdio] [--a30s-fb]
   qemu-sweet.py --shim SHIM-Image-Payload OUTDIR [--watch] ...
 
 --shim boots the REAL a30s shim instead of the stub: the shim binary
@@ -30,8 +31,11 @@ framebuffer using its iso_font into fb.txt and write result.json. This is a
 snapshot of the circular screen, not a complete boot log. --fail-on-panic
 returns 2 when a panic is visible; absence of a panic does not prove boot.
 An undecodable or blank screen returns 3 with --fail-on-panic.
+For A30s tests, --a30s-fb also captures and decodes the 720x1560 ADT
+framebuffer at 0xEC000000. --qmp-stdio uses QMP on standard I/O instead
+of a local Unix socket.
 """
-import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
+import argparse, hashlib, json, os, queue, shutil, socket, struct, subprocess, sys, threading, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
@@ -184,16 +188,22 @@ def payload_data(payload, va, size):
     raise ValueError(f'VA {va:#x}+{size:#x} not in initialized payload segments')
 
 
-def decode_screen(raw, font):
+def decode_screen(raw, font, w=FB_W, h=FB_H, stride=FB_STRIDE):
     """Exact glyph matching for pe_serial.c's 2x, white-on-black fbcon."""
+    if w < 16 or h < 32 or stride < w * 4:
+        raise ValueError(f'invalid framebuffer geometry: {w}x{h}, stride={stride}')
+    if len(raw) < stride * h:
+        raise ValueError(f'framebuffer data truncated: {len(raw)} < {stride * h} bytes')
+    if len(font) < 127 * 16:
+        raise ValueError(f'font data truncated: {len(font)} < {127 * 16} bytes')
     glyphs = {font[c * 16:(c + 1) * 16]: chr(c) for c in range(32, 127)}
     rows, unknown = [], 0
-    for row in range(FB_H // 32):
+    for row in range(h // 32):
         chars = []
-        for col in range(FB_W // 16):
+        for col in range(w // 16):
             glyph = bytearray(16)
             for y in range(16):
-                offset = (row * 32 + y * 2) * FB_STRIDE + col * 16 * 4
+                offset = (row * 32 + y * 2) * stride + col * 16 * 4
                 for x in range(8):
                     if raw[offset + x * 8:offset + x * 8 + 4] == b'\xff' * 4:
                         glyph[y] |= 1 << x
@@ -214,36 +224,99 @@ def screen_result(screen, unknown):
         status = 'no_panic_observed'
     else:
         status = 'blank_screen'
-    return {'status': status, 'unknown_glyphs': unknown, 'snapshot_only': True}
+    return {'status': status, 'unknown_glyphs': unknown, 'snapshot_only': True,
+            'observed_stage': 'framebuffer_snapshot', 'full_boot_verified': False}
+
+
+def apply_expected_text(result, screen, expected):
+    """Record console markers without upgrading a snapshot to a full boot."""
+    result['expected_text'] = expected
+    result['missing_expected_text'] = [item for item in expected if item not in screen]
+    result['markers_satisfied'] = not result['missing_expected_text']
+    result['full_boot_verified'] = False
+    return result
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class QMPStdio:
+    """Small synchronous QMP client for environments that forbid local sockets."""
+    def __init__(self, process):
+        self.process = process
+        self.messages = queue.Queue()
+        self.next_id = 1
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        while True:
+            message = self.messages.get(timeout=15)
+            if 'QMP' in message:
+                break
+        response = self.call('qmp_capabilities')
+        if 'error' in response:
+            raise RuntimeError(f'QMP command qmp_capabilities failed: {response["error"]}')
+
+    def _read(self):
+        for line in self.process.stdout:
+            try:
+                self.messages.put(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    def call(self, execute, **arguments):
+        call_id = self.next_id
+        self.next_id += 1
+        self.process.stdin.write(json.dumps({
+            'execute': execute, 'arguments': arguments, 'id': call_id,
+        }) + '\n')
+        self.process.stdin.flush()
+        while True:
+            message = self.messages.get(timeout=30)
+            if message.get('id') == call_id:
+                return message
 
 
 def qmp(sock_path, *cmds, pmemsave=None):
     """Run QEMU human-monitor commands over QMP (synchronous, unlike the echoing HMP socket)."""
-    s = socket.socket(socket.AF_UNIX)
-    s.connect(sock_path)
-    f = s.makefile('rw')
-    f.readline()
+    if isinstance(sock_path, QMPStdio):
+        call = sock_path.call
+    else:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(sock_path)
+        f = s.makefile('rw')
+        f.readline()
 
-    def call(execute, **args):
-        f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
-        f.flush()
-        while True:
-            r = json.loads(f.readline())
-            if 'return' in r or 'error' in r:
-                return r
+        def call(execute, **args):
+            f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
+            f.flush()
+            while True:
+                r = json.loads(f.readline())
+                if 'return' in r or 'error' in r:
+                    return r
 
-    call('qmp_capabilities')
+        response = call('qmp_capabilities')
+        if 'error' in response:
+            s.close()
+            raise RuntimeError(f'QMP command qmp_capabilities failed: {response["error"]}')
     out = []
     for c in cmds:
         r = call('human-monitor-command', **{'command-line': c})
         if 'error' in r:
             print(f'qmp {c!r}: {r["error"]}', file=sys.stderr)
+            raise RuntimeError(f'QMP command {c!r} failed: {r["error"]}')
         out.append(r.get('return', ''))
     if pmemsave:	# native QMP: HMP's argument parser chokes on '-' in paths
         r = call('pmemsave', val=pmemsave[0], size=pmemsave[1], filename=pmemsave[2])
         if 'error' in r:
             print(f'qmp pmemsave: {r["error"]}', file=sys.stderr)
-    s.close()
+            raise RuntimeError(f'QMP pmemsave failed: {r["error"]}')
+    if not isinstance(sock_path, QMPStdio):
+        s.close()
     return out
 
 
@@ -282,13 +355,21 @@ def main():
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
     ap.add_argument('--gicv2', action='store_true',
                     help='virt board with gic-version=2 (A30s GIC-400 kernel: 0082 compiles out GICv3)')
+    ap.add_argument('--qmp-stdio', action='store_true',
+                    help='use QMP over stdio instead of a local Unix socket')
     ap.add_argument('--shim', metavar='IMAGE-PAYLOAD', help='boot the REAL a30s shim (shim/out/Image-payload) instead of the stub: SBOOT-style handoff with x0 = a QEMU-generated DTB; the single positional is then OUTDIR')
     ap.add_argument('--sboot-state', action='store_true',
                     help='with --shim: enter the shim with MMU+caches on, dirty TLB and junked regs (SBOOT leftover state; tools/sboot_entry.S)')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
+    ap.add_argument('--expect-text', action='append', default=[],
+                    help='require this exact decoded console substring (repeatable; does not assert full boot)')
+    ap.add_argument('--fail-on-missing-text', action='store_true',
+                    help='exit 4 when any --expect-text marker is absent')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--fb-dump', metavar='ADDR,SIZE', help='extra pmemsave region at stop, e.g. 0xEC000000,0x1400000 (the ADT sweet-fbcon the kernel fbcon maps)')
+    ap.add_argument('--a30s-fb', action='store_true',
+                    help='capture/decode A30s ADT fbcon at 0xEC000000 (720x1560)')
     ap.add_argument('--watch', action='store_true', help='keep fb.png/adtfb.png refreshed in the out dir while the VM runs (open in an auto-reloading viewer, e.g. gwenview)')
     ap.add_argument('--watch-int', type=float, default=1.0, help='watch refresh interval in seconds (default: 1.0)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
@@ -316,6 +397,12 @@ def main():
 
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
+    if a.a30s_fb and not a.kernel:
+        ap.error('--a30s-fb requires --kernel for font-based console decoding')
+    if a.fail_on_missing_text and not a.expect_text:
+        ap.error('--fail-on-missing-text requires at least one --expect-text')
+    if a.expect_text and not a.kernel:
+        ap.error('--expect-text requires --kernel')
 
     if not check_qemu_dependency(a.cpu):
         return 1
@@ -324,11 +411,16 @@ def main():
         return 1
 
     shim_image = None
+    input_hashes = {}
     if a.shim:
         shim_image = open(a.shim, 'rb').read()
         payload = find_embedded_payload(shim_image)
+        input_hashes[os.path.abspath(a.shim)] = sha256_file(a.shim)
     else:
         payload = open(a.payload, 'rb').read()
+        input_hashes[os.path.abspath(a.payload)] = sha256_file(a.payload)
+    if a.kernel:
+        input_hashes[os.path.abspath(a.kernel)] = sha256_file(a.kernel)
     font = None
     if a.kernel:
         symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
@@ -346,11 +438,16 @@ def main():
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
 
     mon = f'{out}/mon.sock'
-    if os.path.exists(mon):
+    if not a.qmp_stdio and os.path.exists(mon):
         os.unlink(mon)
-    cmd = ['qemu-system-aarch64', '-M', f'virt,gic-version={2 if a.gicv2 else 3}', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
+    cmd = ['qemu-system-aarch64', '-M', f'virt,gic-version={2 if a.gicv2 else 3}', '-accel', 'tcg',
+           '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+           '-serial', f'file:{out}/serial.txt',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot']
+    if a.qmp_stdio:
+        cmd += ['-display', 'none', '-monitor', 'none', '-qmp', 'stdio']
+    else:
+        cmd += ['-nographic', '-qmp', f'unix:{mon},server,nowait']
     if a.shim:
         open(f'{out}/shim-image.bin', 'wb').write(shim_image)
         open(f'{out}/payload-embedded.bin', 'wb').write(payload)
@@ -387,7 +484,12 @@ def main():
     serial_pos = 0
 
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        if a.qmp_stdio:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 text=True, bufsize=1)
+            mon = QMPStdio(p)
+        else:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         if a.gdb:
             print('gdb stub on :1234; QMP socket:', mon, file=sys.stderr)
             p.wait()
@@ -429,20 +531,31 @@ def main():
         if a.live_serial:
             stream_serial_file(serial_file, serial_pos)
 
-        result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
+        result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode,
+                  'full_boot_verified': False}
+        execution = {'qemu_returncode_before_harness_stop': p.returncode,
+                     'stopped_by_harness': False, 'guest_was_paused': False,
+                     'requested_seconds': a.secs, 'elapsed_seconds': round(time.time() - t0, 3)}
         if p.poll() is None:
             dumps = []
             if a.fb_dump:
                 addr_s, size_s = a.fb_dump.split(',', 1)
-                dumps.append((int(addr_s, 0), int(size_s, 0), f'{out}/adtfb.raw'))
-            _, regs, *extra = qmp(mon, 'stop', 'info registers',
+                name = 'fb-dump.raw' if a.a30s_fb else 'adtfb.raw'
+                dumps.append((int(addr_s, 0), int(size_s, 0), f'{out}/{name}'))
+            if a.a30s_fb:
+                dumps.append((ADT_FB, ADT_FB_STRIDE * ADT_FB_H, f'{out}/adtfb.raw'))
+            _, guest_status, regs, *extra = qmp(mon, 'stop', 'info status', 'info registers',
                                   *a.hmp,
                                   pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+            execution['guest_status_at_snapshot'] = guest_status.strip()
+            execution['guest_was_paused'] = True
             for addr, size, fname in dumps:	# VM is stopped but alive here
                 qmp(mon, pmemsave=(addr, size, fname))
             open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
             p.kill()
             p.wait()
+            execution['stopped_by_harness'] = True
+            execution['harness_stop_signal'] = 'SIGKILL after snapshot; not a guest shutdown'
             raw = open(f'{out}/fb.raw', 'rb').read()
             write_png(f'{out}/fb.png', raw)
             result = {'status': 'not_decoded'}
@@ -450,20 +563,59 @@ def main():
                 screen, unknown = decode_screen(raw, font)
                 open(f'{out}/fb.txt', 'w').write(screen)
                 result = screen_result(screen, unknown)
+                apply_expected_text(result, screen, a.expect_text)
+            if a.a30s_fb:
+                adt_raw = open(f'{out}/adtfb.raw', 'rb').read()
+                write_png(f'{out}/adtfb.png', adt_raw,
+                          ADT_FB_W, ADT_FB_H, ADT_FB_STRIDE)
+                screen, unknown = decode_screen(adt_raw, font,
+                                                ADT_FB_W, ADT_FB_H,
+                                                ADT_FB_STRIDE)
+                open(f'{out}/adtfb.txt', 'w').write(screen)
+                result = screen_result(screen, unknown)
+                apply_expected_text(result, screen, a.expect_text)
+                result['console_source'] = 'A30s ADT framebuffer 0xEC000000 (720x1560)'
             os.unlink(f'{out}/fb.raw')
         else:
             print(f'qemu exited early: {p.returncode}', file=sys.stderr)
 
         open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
-        print(json.dumps(result), file=sys.stderr)
-        print(f'{out}/fb.png  {out}/regs.txt  {out}/qemu.log', file=sys.stderr)
+        outputs = ['result.json', 'regs.txt', 'qemu.log', 'serial.txt', 'fb.png', 'fb.txt']
+        if a.a30s_fb:
+            outputs += ['adtfb.png', 'adtfb.txt']
+        artifact_hashes = {name: sha256_file(f'{out}/{name}')
+                           for name in outputs if os.path.isfile(f'{out}/{name}')}
+        harness_exitcode = 0
         if a.fail_on_panic and result['status'] == 'panic':
-            return 2
-        if a.fail_on_panic and result['status'] in ('incomplete_decode', 'blank_screen'):
-            return 3
-        if result['status'] == 'qemu_exited':
-            return 1
-        return 0
+            harness_exitcode = 2
+        elif a.fail_on_panic and result['status'] in ('incomplete_decode', 'blank_screen'):
+            harness_exitcode = 3
+        elif a.fail_on_missing_text and result.get('missing_expected_text'):
+            harness_exitcode = 4
+        elif result['status'] == 'qemu_exited':
+            harness_exitcode = 1
+        try:
+            qemu_version = subprocess.check_output(
+                ['qemu-system-aarch64', '--version'], text=True).splitlines()[0]
+        except Exception:
+            qemu_version = 'unavailable'
+        metadata = {
+            'mode': 'shim_sboot_state' if a.shim and a.sboot_state else
+                    ('shim' if a.shim else 'direct_entry'),
+            'simulated': True, 'branch_head': subprocess.run(
+                ['git', 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip() or None,
+            'qemu_version': qemu_version, 'qemu_command': cmd,
+            'machine': f'virt,gic-version={2 if a.gicv2 else 3}',
+            'accelerator': 'tcg', 'cpu': a.cpu, 'input_sha256': input_hashes,
+            'execution': execution, 'result': result,
+            'harness_exitcode': harness_exitcode,
+            'artifact_sha256': artifact_hashes,
+        }
+        open(f'{out}/run-metadata.json', 'w').write(json.dumps(metadata, indent=2) + '\n')
+        print(json.dumps(result), file=sys.stderr)
+        extra_outputs = f'  {out}/adtfb.png  {out}/adtfb.txt' if a.a30s_fb else ''
+        print(f'{out}/fb.png  {out}/regs.txt  {out}/qemu.log{extra_outputs}', file=sys.stderr)
+        return harness_exitcode
 
     except KeyboardInterrupt:
         print('\n[!] Interrupted by user, stopping QEMU...', file=sys.stderr)

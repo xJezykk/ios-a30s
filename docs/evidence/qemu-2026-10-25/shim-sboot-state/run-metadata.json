@@ -1,0 +1,81 @@
+{
+  "mode": "shim_sboot_state",
+  "simulated": true,
+  "branch_head": "ee6552674b8c29a0195165a23c4ee87b5f7b4bed",
+  "qemu_version": "QEMU emulator version 11.1.2",
+  "qemu_command": [
+    "qemu-system-aarch64",
+    "-M",
+    "virt,gic-version=2",
+    "-accel",
+    "tcg",
+    "-cpu",
+    "cortex-a53",
+    "-smp",
+    "1",
+    "-m",
+    "4G",
+    "-serial",
+    "file:/tmp/ios-a30s-qemu-20261025/shim/serial.txt",
+    "-d",
+    "int,guest_errors,unimp",
+    "-D",
+    "/tmp/ios-a30s-qemu-20261025/shim/qemu.log",
+    "-no-reboot",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-qmp",
+    "stdio",
+    "-device",
+    "loader,file=/tmp/ios-a30s-qemu-20261025/shim/shim-image.bin,addr=0x42000000,force-raw=on",
+    "-device",
+    "loader,file=/tmp/ios-a30s-qemu-20261025/shim/virt.dtb,addr=0x41000000,force-raw=on",
+    "-device",
+    "loader,file=/tmp/ios-a30s-qemu-20261025/shim/sboot-entry.bin,addr=0x40200000,force-raw=on",
+    "-device",
+    "loader,addr=0x40200000,cpu-num=0"
+  ],
+  "machine": "virt,gic-version=2",
+  "accelerator": "tcg",
+  "cpu": "cortex-a53",
+  "input_sha256": {
+    "/tmp/ios-a30s-qemu.VnFE11/shim-src/out/Image-payload": "2ae5744c1500acf6952d4534bf6879641a65b666ee4b00a069b27d0e2a9eb4f6",
+    "/home/kotorola/iOS na Zjebsungu/a30s-emmc-probe-boot-96aad960/kernel.development.sweet": "8d181ef91cb070cd0c5a5bf3d4bd4603df9c4c91915530a2859864c0ce8edd9d"
+  },
+  "execution": {
+    "qemu_returncode_before_harness_stop": null,
+    "stopped_by_harness": true,
+    "guest_was_paused": true,
+    "requested_seconds": 30.0,
+    "elapsed_seconds": 30.014,
+    "guest_status_at_snapshot": "VM status: paused",
+    "harness_stop_signal": "SIGKILL after snapshot; not a guest shutdown"
+  },
+  "result": {
+    "status": "no_panic_observed",
+    "unknown_glyphs": 0,
+    "snapshot_only": true,
+    "observed_stage": "framebuffer_snapshot",
+    "full_boot_verified": false,
+    "expected_text": [
+      "iBoot version: a30s-shim",
+      "SWEET AMFI: built-in interface registered"
+    ],
+    "missing_expected_text": [],
+    "markers_satisfied": true,
+    "console_source": "A30s ADT framebuffer 0xEC000000 (720x1560)"
+  },
+  "harness_exitcode": 0,
+  "artifact_sha256": {
+    "result.json": "2789e806303d523a619c7d9cda5c686b57e222a77924b592d5cf39329637b8a5",
+    "regs.txt": "bf2cacf5a29c3ea88195cbf92430c3ad033ebca36a4fd72b07e66f4342a98f1f",
+    "qemu.log": "1928a65814f6c29aad26de391d622872dd19f53581a4e215b239e5192e082dd6",
+    "serial.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "fb.png": "b72de5a8deda12190d944815d45da1f0e0c62c10560f46853333b85de16849bd",
+    "fb.txt": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "adtfb.png": "830e58b138d3b92765d2fa70478ca148b7ff76332c6fa9359d7033e0a019e970",
+    "adtfb.txt": "184a5961f383ad67bed0bf89d54e8e1d9a817595e7f39269f95c60b5ac4842ff"
+  }
+}
