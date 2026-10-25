@@ -60,6 +60,7 @@ FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
 A30S_ECID = 0x4133305300000001
 TIMEBASE = 26000000		# CNTFRQ at boot (P1.3), FDT clock-frequency 0x18cba80
 VTIMER_INTID = 27		# FDT timer: type1 PPI 11 (virtual) -> INTID 27
+EMMC_PA, EMMC_SIZE = 0x13500000, 0x2000  # Exynos 7904 dwmmc0, eMMC host
 # cpus=1 for P2.0: boot core only (P1 sec_probe measured the boot MPIDR
 # as 0x80000100 = Aff1 1, Aff0 0 - the big Cortex-A73 cluster). Single
 # CPU = patch 0082 GICv2 self-SGI scope.
@@ -245,6 +246,17 @@ def build():
     pram = node('pram', [ph(),
                          ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
+    # Samsung universal7904 board DTS: dwmmc0 at 0x13500000 is the
+    # non-removable 8-bit eMMC host. The first driver stage only reads its
+    # registers when explicitly requested with emmcprobe=1.
+    emmc = node('sweet-emmc', [
+        ph(),
+        ('compatible', cstr('samsung,exynos-dw-mshc')),
+        ('reg', u64(EMMC_PA, EMMC_SIZE)),
+        ('bus-width', u32(8)),
+        ('non-removable', b''),
+    ])
+
     # Identity of the iPhone X whose userland runs here.
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props \
@@ -263,7 +275,7 @@ def build():
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product)
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram, emmc] + product)
 
 
 if __name__ == '__main__':

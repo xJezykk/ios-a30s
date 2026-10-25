@@ -1,0 +1,109 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,4 +107,5 @@ bsd/dev/memdev.c			standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_emmc.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -930,5 +930,11 @@
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Optional, strictly read-only controller snapshot for A30s bring-up. */
++	extern void sweet_emmc_probe(void);
++	sweet_emmc_probe();
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_emmc.c
+@@ -0,0 +1,80 @@
++/*
++ * A30s DW-MMC handoff probe. This first stage is intentionally read-only:
++ * it records the controller state left by SBOOT and does not reset the host,
++ * change clocks, issue card commands, access the FIFO, or write media.
++ * Enable with boot-arg emmcprobe=1. A functioning root driver requires a
++ * separately validated Exynos clock/host initialization path.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define EMMC_REG_SIZE   0x2000u
++#define EMMC_CTRL       0x00u
++#define EMMC_PWREN      0x04u
++#define EMMC_CLKDIV     0x08u
++#define EMMC_CLKSRC     0x0cu
++#define EMMC_CLKENA     0x10u
++#define EMMC_CTYPE      0x18u
++#define EMMC_CMD        0x2cu
++#define EMMC_MINTSTS    0x40u
++#define EMMC_RINTSTS    0x44u
++#define EMMC_STATUS     0x48u
++#define EMMC_CDETECT    0x50u
++#define EMMC_VERID      0x6cu
++#define EMMC_HCON       0x70u
++#define EMMC_UHS        0x74u
++#define EMMC_BMOD       0x80u
++#define EMMC_DBADDR     0x88u
++#define EMMC_IDSTS      0x8cu
++
++static uint32_t
++emmc_read(volatile uint8_t *base, uint32_t offset)
++{
++	return *(volatile uint32_t *)(base + offset);
++}
++
++void
++sweet_emmc_probe(void)
++{
++	uint32_t enabled = 0;
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int reg_size = 0;
++	volatile uint8_t *base;
++
++	if (!PE_parse_boot_argn("emmcprobe", &enabled, sizeof(enabled)) || !enabled) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &reg_size) != kSuccess ||
++	    reg_size < 2 * sizeof(uintptr_t) || reg[1] < EMMC_REG_SIZE) {
++		printf("SWEET eMMC probe: missing or invalid /sweet-emmc reg\n");
++		return;
++	}
++	base = (volatile uint8_t *)ml_io_map((vm_offset_t)reg[0], (vm_size_t)reg[1]);
++	if (base == NULL) {
++		printf("SWEET eMMC probe: MMIO mapping failed\n");
++		return;
++	}
++	printf("SWEET eMMC probe: pa=%p size=0x%lx ver=0x%08x hcon=0x%08x\n",
++	    (void *)reg[0], (unsigned long)reg[1],
++	    emmc_read(base, EMMC_VERID), emmc_read(base, EMMC_HCON));
++	printf("SWEET eMMC probe: ctrl=%08x pwr=%08x clkdiv=%08x clksrc=%08x clkena=%08x ctype=%08x\n",
++	    emmc_read(base, EMMC_CTRL), emmc_read(base, EMMC_PWREN),
++	    emmc_read(base, EMMC_CLKDIV), emmc_read(base, EMMC_CLKSRC),
++	    emmc_read(base, EMMC_CLKENA), emmc_read(base, EMMC_CTYPE));
++	printf("SWEET eMMC probe: cmd=%08x mintsts=%08x rintsts=%08x status=%08x cdetect=%08x\n",
++	    emmc_read(base, EMMC_CMD), emmc_read(base, EMMC_MINTSTS),
++	    emmc_read(base, EMMC_RINTSTS), emmc_read(base, EMMC_STATUS),
++	    emmc_read(base, EMMC_CDETECT));
++	printf("SWEET eMMC probe: uhs=%08x bmod=%08x dbaddr=%08x idsts=%08x (no writes issued)\n",
++	    emmc_read(base, EMMC_UHS), emmc_read(base, EMMC_BMOD),
++	    emmc_read(base, EMMC_DBADDR), emmc_read(base, EMMC_IDSTS));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
