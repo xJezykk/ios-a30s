@@ -112,7 +112,7 @@ jobs:
           grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
           grep -F 'LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1' dxb/xnu/makedefs/MakeInc.def
           grep -F '&& !defined(SWEET_4K_USERVA)' dxb/xnu/osfmk/mach/arm/vm_param.h
-          if grep -F '__ARM_PAN_AVAILABLE__' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
+          if grep -E '^[[:space:]]*#define[[:space:]]+__ARM_PAN_AVAILABLE__([[:space:]]|$)' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
             echo 'Patch 0084 did not remove the SWEET PAN feature declaration' >&2
             exit 1
           fi
