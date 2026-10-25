@@ -74,9 +74,20 @@ jobs:
           PY
           grep -F 'XNU_VERSION="${XNU_VERSION:-$(curl -s $RELEASE_URL' dxb/build.sh
 
-          # The kernel is plain arm64; libfirehose_kernel also needs arm64.
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is a separate Xcode build: its arm64 default
+          # otherwise follows the macOS runner CPU. Build only the kernel's
+          # arm64 slice and pass the same baseline ISA explicitly.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("dxb/build.sh")
+          s = p.read_text()
+          old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          new = 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a+crypto"'
+          if s.count(old) != 1:
+              raise SystemExit("pinned build.sh libfirehose target changed; refusing an unverified edit")
+          p.write_text(s.replace(old, new))
+          PY
+          grep -F 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-march=armv8-a+crypto"' dxb/build.sh
           ls dxb/patches | wc -l
 
       - name: Install dependencies and select Xcode
@@ -109,8 +120,8 @@ jobs:
           test "$(git -C dxb/xnu describe --tags --exact-match)" = "$XNU_VERSION"
           test "$(git -C dxb/xnu rev-parse HEAD)" = "$(git -C dxb/xnu rev-parse "$XNU_VERSION^{commit}")"
           test "$(git -C dxb/xnu rev-parse HEAD)" = "$XNU_COMMIT"
-          grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
-          grep -F 'LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1 -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
           grep -F '&& !defined(SWEET_4K_USERVA)' dxb/xnu/osfmk/mach/arm/vm_param.h
           if grep -E '^[[:space:]]*#define[[:space:]]+__ARM_PAN_AVAILABLE__([[:space:]]|$)' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
             echo 'Patch 0084 did not remove the SWEET PAN feature declaration' >&2
@@ -121,40 +132,120 @@ jobs:
             exit 1
           fi
           # Inspect actual SWEET clang compile commands. The target setting must
-          # be the last architecture selector, with no explicit LSE override.
+          # be the last architecture selector, after Apple's `-arch` option.
           python3 - <<'PY'
           import shlex
           from pathlib import Path
           commands = []
+          firehose_commands = []
           for line in Path("xnu-build.log").read_text(errors="replace").splitlines():
-              if "clang" not in line or "ARM64_BOARD_CONFIG_SWEET" not in line:
+              if "clang" not in line:
                   continue
               try:
                   args = shlex.split(line)
               except ValueError:
                   continue
+              if "firehose_buffer.c" in line and "-target" in args:
+                  firehose_commands.append(args)
+              if "ARM64_BOARD_CONFIG_SWEET" not in line:
+                  continue
               selectors = [arg for arg in args if arg.startswith(("-march=", "-mcpu="))]
               if selectors:
-                  commands.append((selectors[-1], args))
+                  arch_positions = [i for i, arg in enumerate(args) if arg == "-arch"]
+                  march_positions = [i for i, arg in enumerate(args) if arg.startswith("-march=")]
+                  commands.append((selectors[-1], args, arch_positions, march_positions))
           if not commands:
               raise SystemExit("no verbose SWEET clang compile commands found in build log")
-          bad = [(selector, args) for selector, args in commands
+          bad = [(selector, args) for selector, args, arch_pos, march_pos in commands
                  if selector != "-march=armv8-a+crypto"
-                 or any("+lse" in arg.lower() for arg in args)]
+                 or any("+lse" in arg.lower() for arg in args)
+                 or not arch_pos or not march_pos or march_pos[-1] < arch_pos[-1]]
           if bad:
               for selector, args in bad[:10]:
                   print("unexpected compiler target:", selector, " ".join(args))
-              raise SystemExit("SWEET compiler command overrides ARMv8-A or enables LSE")
-          print(f"verified {len(commands)} SWEET clang commands use ARMv8-A without +lse")
+              raise SystemExit("SWEET compiler command does not apply ARMv8-A after -arch or enables LSE")
+          if len(firehose_commands) != 1:
+              raise SystemExit(f"expected one arm64 firehose_buffer.c compile, found {len(firehose_commands)}")
+          firehose = firehose_commands[0]
+          march = [i for i, arg in enumerate(firehose) if arg.startswith("-march=")]
+          target = next((firehose[i + 1] for i, arg in enumerate(firehose[:-1]) if arg == "-target"), "")
+          target_pos = next((i for i, arg in enumerate(firehose[:-1]) if arg == "-target"), -1)
+          if (target != "arm64-apple-macos14.0" or not march
+                  or firehose[march[-1]] != "-march=armv8-a+crypto"
+                  or march[-1] < target_pos
+                  or any("+lse" in arg.lower() for arg in firehose)):
+              raise SystemExit("libfirehose arm64 compile is not constrained to ARMv8-A")
+          print(f"verified {len(commands)} SWEET commands apply ARMv8-A after -arch")
+          print("verified libfirehose arm64 compile uses ARMv8-A")
           PY
           test -s dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
 
       - name: Check kernel executable sections for LSE instructions
+        id: lse_scan
         run: |
+          set -euo pipefail
           python3 -m venv .venv-lse-check
           . .venv-lse-check/bin/activate
           python -m pip install --disable-pip-version-check 'capstone==5.0.6'
-          python tools/check-arm64-lse.py dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          set +e
+          python tools/check-arm64-lse.py dxb/fakeroot/System/Library/Kernels/kernel.development.sweet 2>&1 | tee lse-scan.log
+          scan_status=${PIPESTATUS[0]}
+          set -e
+          exit "$scan_status"
+
+      - name: Capture failed kernel and symbols for LSE diagnosis
+        if: always() && steps.lse_scan.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          diag=failed-kernel-diagnostic
+          obj=dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET
+          candidate=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          mkdir -p "$diag"
+          test -s "$candidate"
+          cp "$candidate" "$diag/kernel.development.sweet.candidate"
+          for item in \
+            "$obj/kernel.development.sweet.unstripped" \
+            "$obj/kernel.development.sweet.dSYM" \
+            "$obj/kernel.development.sweet.link/kernel.development.sweet.a" \
+            "$obj/kernel.development.sweet.link/kernel.development.sweet.exp" \
+            "$obj/kernel.development.sweet.link/kernel.development.sweet.alias.exp" \
+            "$obj/kernel.development.sweet.link/kernel.development.sweet.linkarguments" \
+            "$obj/kernel.development.sweet.link/kernel.development.sweet.linkarchives" \
+            dxb/fakeroot/usr/local/lib/kernel/libfirehose_kernel.a \
+            dxb/libdispatch/src/firehose/firehose_buffer.c; do
+            if [ -e "$item" ]; then
+              cp -R "$item" "$diag/"
+            else
+              echo "missing diagnostic input: $item" >> "$diag/MISSING.txt"
+            fi
+          done
+          xcrun nm -nm "$obj/kernel.development.sweet.unstripped" > "$diag/kernel-symbols.nm.txt" 2>&1 || true
+          dwarf="$obj/kernel.development.sweet.dSYM/Contents/Resources/DWARF/kernel.development.sweet"
+          if [ -s "$dwarf" ]; then
+            xcrun atos -arch arm64 -o "$dwarf" -l 0xfffffff007004000 \
+              0xfffffff00725c188 0xfffffff00725c23c 0xfffffff007272d54 \
+              > "$diag/representative-addresses.atos.txt" 2>&1 || true
+          fi
+          cp lse-scan.log "$diag/" || true
+          {
+            echo "repository_commit=$GITHUB_SHA"
+            echo "xnu_commit=$(git -C dxb/xnu rev-parse HEAD)"
+            echo "libdispatch_commit=$(git -C dxb/libdispatch rev-parse HEAD)"
+            echo "kernel_candidate=$candidate"
+            echo "kernel_candidate_sha256=$(shasum -a 256 "$candidate" | awk '{print $1}')"
+            echo "kernel_candidate_bytes=$(stat -f %z "$candidate")"
+            echo "scan_status=failure; candidate is diagnostic only and is not a verified artifact"
+          } > "$diag/DIAGNOSTIC-PROVENANCE.txt"
+          (cd "$diag" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 shasum -a 256 > SHA256SUMS)
+
+      - name: Upload failed kernel diagnosis bundle
+        if: always() && steps.lse_scan.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-failed-kernel-diagnostic-${{ github.sha }}
+          path: failed-kernel-diagnostic/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Collect verified kernel and provenance
         run: |
