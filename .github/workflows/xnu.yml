@@ -1,25 +1,20 @@
 name: xnu
 
+run-name: XNU DEVELOPMENT.SWEET (${{ github.sha }})
+
 on:
   workflow_dispatch:
-    inputs:
-      macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
-        default: "13.5"
-      kernel_config:
-        description: RELEASE / DEVELOPMENT / DEBUG
-        default: DEVELOPMENT
-      machine_config:
-        description: xnu MACHINE_CONFIG
-        default: SWEET
-      keep_going:
-        description: make -k (collect all compile errors in one run)
-        default: "true"
+  pull_request:
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
+      - "tools/check-arm64-lse.py"
   push:
     branches: [main]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
+      - "tools/check-arm64-lse.py"
 
 concurrency:
   group: xnu-${{ github.ref }}
@@ -34,9 +29,13 @@ env:
   # repo; patches shipped in this repo are Exynos-only.
   SWEET_REPO: https://github.com/dipa-studio/ios-sweet
   SWEET_SHA: 45263bee51df4a0f55cdf9c649af886399488ddb
-  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
-  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # Fixed target: macOS 13.5's XNU 8796.141.3, DEVELOPMENT, SWEET.
+  MACOS_VERSION: "13.5"
+  XNU_VERSION: "xnu-8796.141.3"
+  XNU_COMMIT: "1b191cb58250d0705d8a51287127505aa4bc0789"
+  KERNEL_CONFIG: DEVELOPMENT
+  ARCH_CONFIG: ARM64
+  MACHINE_CONFIG: SWEET
 
 jobs:
   build:
@@ -47,31 +46,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch build script and upstream patch series
+      - name: Fetch pinned build script and upstream patch series
         run: |
+          set -euo pipefail
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # Patch series: the upstream 0001-0081 set (patches + stage
-          # scripts) is fetched from the pinned ios-sweet commit; this
-          # repo only carries its own Exynos patches (0082+). After
-          # this step xnu/patches holds the merged series in glob
-          # order (0001..0081 then 0082).
           git init -q sweet
           git -C sweet fetch -q --depth 1 "$SWEET_REPO" "$SWEET_SHA"
           git -C sweet checkout -q FETCH_HEAD
           cp sweet/xnu/patches/* xnu/patches/
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          test -f dxb/patches/0084-a30s-4k-user-va.patch
+
+          # Pinned wrapper currently resolves XNU through a live release
+          # manifest. Make its existing overrideable assignment honor the
+          # exact source tag fixed above; fail if upstream changes that line.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("dxb/build.sh")
+          s = p.read_text()
+          old = '''XNU_VERSION=$(curl -s $RELEASE_URL | jq -r '.projects[] | select(.project=="xnu") | .tag')'''
+          new = '''XNU_VERSION="${XNU_VERSION:-$(curl -s $RELEASE_URL | jq -r '.projects[] | select(.project=="xnu") | .tag')}"'''
+          if s.count(old) != 1:
+              raise SystemExit("pinned build.sh get_xnu assignment changed; refusing an unverified edit")
+          p.write_text(s.replace(old, new))
+          PY
+          grep -F 'XNU_VERSION="${XNU_VERSION:-$(curl -s $RELEASE_URL' dxb/build.sh
+
+          # The kernel is plain arm64; libfirehose_kernel also needs arm64.
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches | wc -l
 
-      - name: Deps
+      - name: Install dependencies and select Xcode
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          # build.sh checks xcodes, while Xcode is preinstalled on macos-14.
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
@@ -82,18 +93,101 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
-      - name: Build
+      - name: Build XNU DEVELOPMENT.SWEET
         working-directory: dxb
         env:
-          # keep going after errors so one run reports every compile failure
-          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+          XNU_VERSION: ${{ env.XNU_VERSION }}
+        run: |
+          set -euo pipefail
+          # A new checkout has no build directory; make stale-output reuse fatal.
+          test ! -e build/xnu.obj/kernel.development.sweet
+          bash build.sh 2>&1 | tee ../xnu-build.log
+
+      - name: Verify source revision, applied target, and fresh kernel
+        run: |
+          set -euo pipefail
+          test "$(git -C dxb/xnu describe --tags --exact-match)" = "$XNU_VERSION"
+          test "$(git -C dxb/xnu rev-parse HEAD)" = "$(git -C dxb/xnu rev-parse "$XNU_VERSION^{commit}")"
+          test "$(git -C dxb/xnu rev-parse HEAD)" = "$XNU_COMMIT"
+          grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY -DSWEET_4K_USERVA=1' dxb/xnu/makedefs/MakeInc.def
+          grep -F '&& !defined(SWEET_4K_USERVA)' dxb/xnu/osfmk/mach/arm/vm_param.h
+          if grep -F '__ARM_PAN_AVAILABLE__' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
+            echo 'Patch 0084 did not remove the SWEET PAN feature declaration' >&2
+            exit 1
+          fi
+          if grep -E 'MACHINE_FLAGS_ARM64_SWEET.*(armv8\.[1-9]|\+lse)' dxb/xnu/makedefs/MakeInc.def; then
+            echo 'Unexpected SWEET target enables ARMv8.1+ or LSE' >&2
+            exit 1
+          fi
+          # Inspect actual SWEET clang compile commands. The target setting must
+          # be the last architecture selector, with no explicit LSE override.
+          python3 - <<'PY'
+          import shlex
+          from pathlib import Path
+          commands = []
+          for line in Path("xnu-build.log").read_text(errors="replace").splitlines():
+              if "clang" not in line or "ARM64_BOARD_CONFIG_SWEET" not in line:
+                  continue
+              try:
+                  args = shlex.split(line)
+              except ValueError:
+                  continue
+              selectors = [arg for arg in args if arg.startswith(("-march=", "-mcpu="))]
+              if selectors:
+                  commands.append((selectors[-1], args))
+          if not commands:
+              raise SystemExit("no verbose SWEET clang compile commands found in build log")
+          bad = [(selector, args) for selector, args in commands
+                 if selector != "-march=armv8-a+crypto"
+                 or any("+lse" in arg.lower() for arg in args)]
+          if bad:
+              for selector, args in bad[:10]:
+                  print("unexpected compiler target:", selector, " ".join(args))
+              raise SystemExit("SWEET compiler command overrides ARMv8-A or enables LSE")
+          print(f"verified {len(commands)} SWEET clang commands use ARMv8-A without +lse")
+          PY
+          test -s dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+
+      - name: Check kernel executable sections for LSE instructions
+        run: |
+          python3 -m venv .venv-lse-check
+          . .venv-lse-check/bin/activate
+          python -m pip install --disable-pip-version-check 'capstone==5.0.6'
+          python tools/check-arm64-lse.py dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+
+      - name: Collect verified kernel and provenance
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp dxb/fakeroot/System/Library/Kernels/kernel.development.sweet out/kernel.development.sweet
+          shasum -a 256 out/kernel.development.sweet > out/SHA256SUMS
+          cat > out/BUILD-PROVENANCE.txt <<EOF
+          repository_commit=${GITHUB_SHA}
+          darwin_xnu_build_commit=${DXB_SHA}
+          upstream_patch_repository_commit=${SWEET_SHA}
+          xnu_tag=${XNU_VERSION}
+          xnu_expected_commit=${XNU_COMMIT}
+          xnu_commit=$(git -C dxb/xnu rev-parse HEAD)
+          macos_release=${MACOS_VERSION}
+          kernel_config=${KERNEL_CONFIG}
+          arch_config=${ARCH_CONFIG}
+          machine_config=${MACHINE_CONFIG}
+          applied_a30s_patch=0084-a30s-4k-user-va.patch
+          verified_sweet_arch_flags=-march=armv8-a+crypto
+          EOF
+
+      - name: Upload XNU build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-build-log-${{ github.sha }}
+          path: xnu-build.log
+          if-no-files-found: warn
 
       - name: Package build tree for local compiles
         if: always()
         run: |
-          # Generated headers, config option headers, mig output and the patched
-          # source: enough to re-run any single compile command from the log locally.
           SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
@@ -107,33 +201,31 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: xnu-buildtree-${{ github.sha }}
           path: buildtree.tgz
           retention-days: 7
 
       - name: Inspect closed KDK support libs
         if: always()
         run: |
-          mkdir -p out/kdk-libs
+          mkdir -p diagnostics/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
             b=$(basename "$lib" .a)
-            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
-            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
-            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+            ar t "$lib" > "diagnostics/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "diagnostics/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> diagnostics/kdk-libs/arch.txt 2>&1 || true
           done
-          ls -la out/kdk-libs
 
-      - name: Collect
-        if: always()
-        run: |
-          mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
-          ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: xnu-kernel-${{ github.sha }}
+          path: out/
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
-          path: out/
+          name: xnu-build-diagnostics-${{ github.sha }}
+          path: diagnostics/
           if-no-files-found: warn
