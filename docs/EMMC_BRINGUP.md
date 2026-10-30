@@ -48,6 +48,19 @@ payload tool still describes an in-memory `RAMDisk` (`rd=md0`), and the
 experimental driver does not make an iPhone X IPSW root filesystem usable
 on the A30s.
 
+The normal XNU root path is already used for `rd=emmcroot0`: `IOFindBSDRoot`
+selects the eMMC block device, `vfs_mountroot()` probes registered filesystem
+implementations, and the built-in SWEET HFS implementation mounts the device
+before BSD starts `/sbin/launchd`. Patch 0089 adds SWEET-only messages around
+root selection and each filesystem mount attempt so a hardware boot can
+distinguish eMMC, filesystem, and process-launch failures.
+
+The root image must be HFS+. The HFS implementation deliberately rejects
+legacy HFS as a root filesystem (`hfs_reload()` returns `EINVAL` for the
+classic HFS signature), so a legacy `hformat` image is not a valid substitute.
+The current WSL environment can create HFS+ images but cannot mount them
+read-write; populate the image on a Linux host with loop-device support.
+
 ## Safe implementation sequence
 
 1. Establish that patch 0088 applies after patches 0086 and 0087 and builds

@@ -1,0 +1,48 @@
+﻿--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1147,6 +1147,10 @@
+ 		strlcpy(rootdevice, "sd0a", sizeof(rootdevice));
+ 		flags = 0;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET root selection: name=%s dev=%u,%u flags=0x%x err=%d\n",
++	    rootdevice, major(rootdev), minor(rootdev), flags, err);
++#endif
+ 
+ #if CONFIG_NETBOOT
+ 	if (flags & 1) {
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1243,6 +1243,9 @@
+ 		KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, error, 1);
+ 		return error;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET root mount: bdev=%u,%u\n", major(rootdev), minor(rootdev));
++#endif
+ 	/*
+ 	 * 4951998 - code we call in vfc_mountroot may replace rootvp
+ 	 * so keep a local copy for some house keeping.
+@@ -1275,6 +1278,10 @@
+ 		} else {
+ 			error = VFS_MOUNT(mp, rootvp, 0, ctx);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET root mount: fs=%s result=%d\n",
++		    vfsp->vfc_name ? vfsp->vfc_name : "unknown", error);
++#endif
+ 
+ 		if (!error) {
+ 			if (bdevvp_rootvp != rootvp) {
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -794,6 +794,9 @@
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName,
+ 		    major(*root), minor(*root));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		IOLog("SWEET root handoff: emmcroot0 -> VFS root mount\n");
++#endif
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
