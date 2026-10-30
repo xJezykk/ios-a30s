@@ -3,6 +3,7 @@
 # accepts (Android boot header v1, 2048-byte pages, load at 0x10008000).
 #   P1 probe (default):   ./build.sh                    -> out/shim-a30s-p1.img
 #   XNU payload build:    ./build.sh PAYLOAD [OUT]      -> out/shim-a30s-p2.img
+#   Read-only diagnostics: ./build.sh DIAG [OUT]        -> out/shim-a30s-diag.img
 # The payload (mkpayload.py output) is appended to a copy of out/Image
 # behind the linker-script info block _payload_info; loader.c finds it
 # PC-relatively, so SBOOT's drifting load base (P1.5c) never matters.
@@ -12,28 +13,48 @@ cd "$(dirname "$0")"
 CC="clang --target=aarch64-unknown-none-elf"
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
 
+MODE="boot"
 PAYLOAD="${1:-}"
 OUTIMG="${2:-out/shim-a30s-p2.img}"
 KIMG="out/Image"
+ELF="out/shim.elf"
+SOURCES="start.S a30s.c console.c loader.c"
+
+if [ "$PAYLOAD" = "DIAG" ]; then
+	MODE="diag"
+	PAYLOAD=""
+	OUTIMG="${2:-out/shim-a30s-diag.img}"
+	KIMG="out/Image-diag"
+	ELF="out/shim-diag.elf"
+	SOURCES="start.S diag.c console.c"
+fi
 
 mkdir -p out
-for f in start.S a30s.c console.c loader.c; do
+for f in $SOURCES; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
 
-abs=$(llvm-readelf -r out/a30s.o out/console.o out/loader.o 2>/dev/null | grep -c ABS64 || true)
+OBJECTS="out/start.o out/console.o"
+if [ "$MODE" = "diag" ]; then
+	OBJECTS="$OBJECTS out/diag.o"
+	C_OBJECTS="out/console.o out/diag.o"
+else
+	OBJECTS="$OBJECTS out/a30s.o out/loader.o"
+	C_OBJECTS="out/a30s.o out/console.o out/loader.o"
+fi
+
+abs=$(llvm-readelf -r $C_OBJECTS 2>/dev/null | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 
-ld.lld -T shim.ld -N -o out/shim.elf \
-	out/start.o out/a30s.o out/console.o out/loader.o
+ld.lld -T shim.ld -N -o "$ELF" $OBJECTS
 
-llvm-objcopy -O binary out/shim.elf "$KIMG"
+llvm-objcopy -O binary "$ELF" "$KIMG"
 
-end=$(llvm-nm out/shim.elf | awk '$3=="_end"{print $1}')
+end=$(llvm-nm "$ELF" | awk '$3=="_end"{print $1}')
 sz=$(( 0x$end ))
 truncate -s "$sz" "$KIMG"
 
-pinfo=$(llvm-nm out/shim.elf | awk '$3=="_payload_info"{print $1}')
+pinfo=$(llvm-nm "$ELF" | awk '$3=="_payload_info"{print $1}')
 [ -n "$pinfo" ] || { echo "error: no _payload_info symbol" >&2; exit 1; }
 
 if [ -n "$PAYLOAD" ]; then
@@ -52,7 +73,9 @@ open(out_name, 'wb').write(img)
 print(f"patch: pinfo@{pinfo_off:#x} payload@{start:#x} size={len(pl):#x} delta={delta:#x}")
 EOF
 else
-	OUTIMG="out/shim-a30s-p1.img"
+	if [ "$MODE" = "boot" ]; then
+		OUTIMG="out/shim-a30s-p1.img"
+	fi
 fi
 
 # Empty newc ramdisk (SBOOT likely still wants one; a few dozen bytes).

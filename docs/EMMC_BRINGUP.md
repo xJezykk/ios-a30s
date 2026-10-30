@@ -36,38 +36,42 @@
 
 ## Current state
 
-The generated A30s ADT now includes `/sweet-emmc`, describing the Exynos
-7904 DW-MMC controller at physical `0x13500000` and a non-removable, 8-bit
-slot. XNU patch 0086 adds an opt-in, read-only register snapshot. The
-payload tool still only describes an in-memory `RAMDisk` (`rd=md0`); no
-physical eMMC block device or partition reader exists. The generic SWEET
-root driver is for Qualcomm UFS and cannot be reused as this phone's host
-driver. The Samsung DTS enables DDR, HS200 and HS400 modes, but its board
-clock, pin, voltage, and timing setup is not yet implemented in XNU.
+The generated A30s ADT now describes the Exynos 7904 DW-MMC0 host at
+`/arm-io/dwmmc0`, with the SOC-relative register and CMDQ windows, interrupt,
+and non-removable 8-bit slot. Patch 0086 retains the opt-in, read-only
+register probe; patch 0088 replaces it with an experimental polled PIO eMMC
+block device and routes `rd=emmcroot0` to a GPT partition (`emmcroot=`,
+default `userdata`). Writes are disabled unless `emmcw=1` is supplied and
+are bounded to that selected partition. The driver has not been compiled
+against the complete XNU build environment or tested on the phone. The
+payload tool still describes an in-memory `RAMDisk` (`rd=md0`), and the
+experimental driver does not make an iPhone X IPSW root filesystem usable
+on the A30s.
 
 ## Safe implementation sequence
 
-1. Add an opt-in, read-only XNU eMMC probe. It must validate the live host
-   state and report controller registers/card identity without resetting
-   the controller, changing clock timing, or writing to media.
-2. Add polled block reads only after the probe and DMA/cache requirements
-   are understood. Keep writes unavailable by construction.
-3. Locate a named GPT partition and expose it as a distinct read-only BSD
-   block device. Root selection must remain opt-in (`rd=...`) and fail
-   clearly if the controller/card/partition is unavailable.
-4. Before attempting any root-image work, establish which IPSW files are
+1. Establish that patch 0088 applies after patches 0086 and 0087 and builds
+   with the pinned XNU source and its supported toolchain. Resolve any
+   compile-time API or locking issues before attempting hardware access.
+2. Keep hardware testing opt-in. First test controller initialization and
+   read-only access to a known-safe partition; do not enable `emmcw=1` on
+   Android `userdata`. If the bootloader handoff or card state differs from
+   assumptions, stop rather than repeatedly resetting or retraining it.
+3. Before attempting any root-image work, establish which IPSW files are
    usable by the experimental XNU port. An iPhone X IPSW root filesystem is
    not presumed mountable or executable on the A30s. Any extracted image is
    a host-only artifact until its format, compatibility, and size are proven.
-5. Require CI kernel build, LSE scan, QEMU regression checks, and source
+4. Require CI kernel build, LSE scan, QEMU regression checks, and source
    review before considering hardware testing. No phone test is part of
    this work without separate human approval.
 
 ## Known limitations
 
-The boot path has not yet measured the DW-MMC state handed off by SBOOT.
-The Linux driver depends on Exynos CMU clocks, pinctrl, voltage/timing
-configuration, and DMA/cache handling. The generic controller address and
-Linux source alone do not prove the host remains initialized at XNU entry.
-Do not advertise a `userdata` image as bootable until XNU can read the
-target partition and the complete root has been mounted successfully.
+The shim has measured controller registers, including the A30s `CLKSEL`
+value, but has not established card protocol state or proven an XNU block
+read. The experimental driver assumes the live Exynos clock source and
+programs legacy SDR timing; the source-derived clock rate and its suitability
+at XNU entry remain unverified. It uses PIO, but still needs a supported
+build, hardware validation, and confirmation that the selected root partition
+contains a compatible, bootable filesystem. Do not treat `userdata` as a
+safe write target or advertise it as bootable before those conditions hold.

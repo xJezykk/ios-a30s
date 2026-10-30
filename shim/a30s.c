@@ -38,7 +38,18 @@
 #define GICD_BASE	0x12301000UL	/* fdt gic node: GIC-400 */
 #define GICC_BASE	0x12302000UL
 #define WDT_BASE	0x10060000UL	/* /watchdog@10060000 */
+#define DWMMC0_BASE	0x13500000UL	/* A30s DTS: dwmmc_0 reg, window 0x2000 */
 #define RAM_UPPER	0x880000000UL	/* 2 GiB upper bank */
+
+/* 32-bit Synopsys DW-MMC offsets from the A30s kernel's Exynos driver. */
+#define DWMMC_CTRL	0x000
+#define DWMMC_PWREN	0x004
+#define DWMMC_CLKDIV	0x008
+#define DWMMC_CLKENA	0x010
+#define DWMMC_CTYPE	0x018
+#define DWMMC_STATUS	0x048
+#define DWMMC_VERID	0x06c
+#define DWMMC_HCON	0x070
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_CPU_SUSPEND	0xc4000001UL
@@ -66,6 +77,24 @@ extern volatile uint64_t sec_probe[];
 static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
 static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static inline uint32_t rd32be(uintptr_t a) { return __builtin_bswap32(rd32(a)); }
+
+static void dwmmc0_snapshot(void)
+{
+	/*
+	 * Read-only snapshot. HCON/VERID are read-only IDs, STATUS is a
+	 * live read-only flag/count register, and the remaining registers
+	 * are configuration registers that this probe only reads. Never
+	 * touch CMD or interrupt-status registers.
+	 */
+	con_hex3("MMC0", "ctrl=", rd32(DWMMC0_BASE + DWMMC_CTRL),
+		 "pwr=", rd32(DWMMC0_BASE + DWMMC_PWREN),
+		 "clk=", rd32(DWMMC0_BASE + DWMMC_CLKENA));
+	con_hex2("MMCID", "hcon=", rd32(DWMMC0_BASE + DWMMC_HCON),
+		 "ver=", rd32(DWMMC0_BASE + DWMMC_VERID));
+	con_hex3("MMCRUN", "stat=", rd32(DWMMC0_BASE + DWMMC_STATUS),
+		 "type=", rd32(DWMMC0_BASE + DWMMC_CTYPE),
+		 "div=", rd32(DWMMC0_BASE + DWMMC_CLKDIV));
+}
 
 static const char *stage;	/* runtime strings only: no abs pointers */
 
@@ -369,6 +398,7 @@ void shim_main(uint64_t dtb, uint64_t boot_el, uint64_t boot_mpidr)
 		else
 			return;		/* jumped into xnu; never returns */
 	}
+	dwmmc0_snapshot();
 	con_skip();
 
 	/* band 0: live FDT */

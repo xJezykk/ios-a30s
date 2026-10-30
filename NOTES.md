@@ -39,6 +39,14 @@ XNU (same recipe as ios-sweet, different SoC: Exynos 7904).
   0x14000 = 82 KB).
 - The shim image carries an entry branch at BOTH file offset 0 and the
   ARM64-spec offset 0x80, so either SBOOT entry convention works.
+- A separate, non-invasive handoff image can be built with
+  `shim/build.sh DIAG [OUT]` (`shim/out/shim-a30s-diag.img` by default).
+  It reports the minimal kernel handoff and memory facts plus the
+  A30s DW-MMC0 configuration/status/ID registers. It does not link
+  `a30s.c`, so it does not run that probe's RAM test, watchdog write,
+  or PMC experiment; its only device-register accesses are the
+  documented 32-bit DW-MMC reads. The image halts after displaying
+  the report.
 
 ## Restore plan for the flash steps (to be confirmed with the user)
 
@@ -746,7 +754,93 @@ rd=md0 ignition_level=1 wdt=-1` style; console = sweetfbcon on fb.
    CI wait; rides the next flash round.
 2. Live verification of the GICv2 path (0082): vtimer PPI 27 via
    sleh_gicv2 branch, SGI self-signaling from SweetCPU::signalCPU.
-2. DW-MMC driver for eMMC (the biggest new driver; reference: Samsung
-   GPL dw_mmc-exynos.c), then the iOS root in userdata.
+2. DW-MMC driver for eMMC (the biggest new driver), then the iOS root
+   in userdata. P3 groundwork below records the A30s controller node;
+   the runtime state, clocks, and command path still need verification.
 3. DECON/DSIM niceties (panel persistence assumptions get their real
    answer live with the P2 boot itself).
+
+### P3 eMMC driver groundwork (2026-10-29)
+
+- Samsung's public A30s DTS identifies `dwmmc_0` at `0x13500000`
+  (register window `0x2000`), CMDQ window `0x13508000` (`0x200`),
+  DT interrupt `<0 146 0>` (GIC INTID 178), an 8-bit bus, and a
+  non-removable card. Source: `samsungexynos7904/android_kernel_samsung_exynos7904`
+  at `d60ebe908d6977194c0d81e4d1b9f2709a364c3d`,
+  `arch/arm64/boot/dts/exynos/dtb/{exynos7885.dtsi,exynos7904-a30s_common.dtsi}`.
+- `tools/mkadt-a30s.py` now emits `/arm-io/dwmmc0`; the two register
+  windows are encoded relative to `SOC_BASE`, consistent with the GIC
+  node. The ADT entry is discovery metadata; it does not itself configure
+  or access storage.
+- `shim/a30s.c` now prints a read-only DW-MMC0 register snapshot only
+  on the diagnostic fallback path (when XNU payload loading fails).
+  It does not reset or reconfigure the host; the snapshot is needed to
+  determine whether SBOOT leaves a usable card/clock state.
+- The offsets/widths are from that same A30s kernel's
+  `drivers/mmc/host/dw_mmc.h`: 32-bit registers; `HCON` 0x70 and
+  `VERID` 0x6c are hardware/version IDs, and `STATUS` 0x48 is a live
+  read-only status/count register. `CTRL`, `PWREN`, `CLKENA`, `CTYPE`,
+  and `CLKDIV` are configuration registers read through 32-bit loads.
+  The probe deliberately does not read `CMD`, `MINTSTS`, or `RINTSTS`.
+- The address/capability facts above come from the public board DTS.
+  The live register values below come from the user's diagnostic run.
+  They do not establish card protocol state or prove a block read.
+  The experimental XNU driver has not been run on the phone.
+- First user-supplied live read-only A30s snapshot (2026-10-30):
+  `CTRL=0x10`, `PWREN=1`, `CLKDIV=1`, `CLKENA=1`,
+  `CTYPE=0x10000` (8-bit), `STATUS=0x8906`,
+  `HCON=0x08E42541`, `VERID=0x5342270A`. The status has DATA_BUSY
+  clear and FIFO-empty set; controller appears idle. `CTRL` has the
+  interrupt-enable bit set and DMA-enable clear. The snapshot does
+  not establish card RCA/state or timing mode, so it is not yet a
+  successful block read and is insufficient to safely reset/retrain
+  the host.
+- Follow-up live values: `CLKSRC=0`, `TMOUT=0xFFFFFFFF`,
+  `FIFOTH=0x20100010`, `UHS_REG=0x00010000`. The displayed
+  `CLKSEL` label was clipped; the value read at 0x9c was zero, but
+  Samsung's A30s-kernel header selects offset 0x9c or 0xa8 depending
+  on `CONFIG_MMC_DW_64BIT_DESC`. The next diagnostic reports both
+  documented candidate offsets without writing either register.
+- A follow-up showed `cpus=0x1b`: this was a diagnostic counting bug
+  that included `cpu*` nodes outside `/cpus` (such as `cpu-map`), not
+  27 processor cores. The parser now counts only direct CPU children
+  of the FDT `/cpus` node; the Samsung A30s DTS has eight CPU nodes.
+- `shim/diag.c` was extended to read the A30s-documented `CLKSRC`,
+  `TMOUT`, `FIFOTH`, `UHS_REG`, and Exynos `CLKSEL` registers, still
+  read-only. The Samsung Exynos header makes `CLKSEL` conditional:
+  offset 0x9c without `CONFIG_MMC_DW_64BIT_DESC`, offset 0xa8 with it.
+  The reported zero at 0x9c is not the active clock selection for the
+  referenced A30s configuration.
+- The diagnostic display was reduced to EL/CPU/timer/MMU/DTB, FDT CPU
+  and memory summary, optional initrd range, and the DW-MMC0 registers
+  relevant to host configuration and identification. Image/stack
+  addresses, framebuffer details, and low-level FDT layout are omitted.
+- The previous live CPU count of zero showed that matching node names
+  was not reliable for the bootloader's FDT. The parser now counts a
+  direct `/cpus` child only when its `device_type` property is `cpu`.
+- The `topser9/kernel_samsung_universal7885` A30s defconfig enables
+  `CONFIG_MMC_DW_64BIT_DESC`; that source therefore places `CLKSEL` at
+  0xa8. The earlier DIAG6 `A0=0x90700200` value is not CLKSEL and must
+  not be decoded as such; DIAG7 reports offsets 0x9c and 0xa8. In that
+  source, the divider is bits 26:24 (encoded value plus one), the drive
+  setting is bits 18:16, and the sample setting is bits 2:0. The value
+  from offset 0xa8 was `0x03040002`: divider encoding 3 (divide by 4),
+  drive setting 4, sample setting 2. This matches the A30s DDR timing
+  tuple `<3 0 4 2>`.
+
+- The pinned Exynos source gives `dw_mci_exynos_setup_clock()` as
+  `clk_get_rate(host->ciu_clk) / (ciu_div + 1)`; A30s sets `ciu_div = 3`.
+  The Exynos 7885 MMC_EMBD VCLK table has one rate, 799500 kHz
+  (799.5 MHz). Therefore the DW-MMC input clock is inferred as 199.875 MHz,
+  and live `CLKDIV=1` corresponds to about 99.94 MHz. For reset,
+  `CLKDIV=255` yields about 392 kHz. The A30s SDR tuple `<3 0 4 0>`
+  corresponds to `CLKSEL=0x03040000`; with `CLKDIV=4`, the eMMC clock is
+  inferred as about 24.98 MHz, below the legacy 26 MHz limit. These rates
+  have not been independently measured at XNU entry.
+- `xnu/patches/0088-a30s-dwmmc-emmc.patch` adds a polled PIO block driver
+  and `rd=emmcroot0` routing. It reads a GPT-selected partition
+  (`emmcroot=`, default `userdata`), validates the GPT CRCs and bounds,
+  and is read-only unless `emmcw=1` is supplied. Every write is checked
+  against the selected partition. The patch has not been compiled with the
+  complete XNU build environment or run on the phone. Do not enable writes
+  on the Android `userdata` partition during bring-up.
