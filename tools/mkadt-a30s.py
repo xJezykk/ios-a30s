@@ -26,7 +26,10 @@ Data model differences vs the Qualcomm reference:
   - kernel RAM home = bank2 0xC0000000-0xF5400000 (cleanest band: no
     SBOOT/TZ carve-outs like bank1) - dram-base/dram-size report
     0xC4000000 + 0x31300000 after carving the 1 MiB panic log at
-    0xF5300000..0xF5400000.
+    0xF5300000..0xF5400000;
+  - eMMC is the Exynos DW-MMC host at 0x13500000, from Samsung's
+    A30s DTS. This ADT entry is for driver discovery; runtime handoff
+    state and clocking still need on-device verification.
 """
 import hashlib, os, struct, sys
 
@@ -56,6 +59,12 @@ GICC_QEMU, GICD_QEMU = 0x08010000, 0x08000000
 # fbcon: s3cfb.bootloaderfb=0xEC000000 (also a stock reserved-memory node)
 FB, FB_SIZE = 0xec000000, 0x1400000
 FB_W, FB_H, FB_STRIDE = 720, 1560, 720 * 4
+# Exynos DW-MMC 0 hosts the soldered eMMC. Addresses are from Samsung's
+# exynos7904-a30s_common.dtsi / exynos7885.dtsi; /arm-io reg values are
+# relative to SOC_BASE, matching the GIC node above.
+DWMMC0, DWMMC0_SIZE = 0x13500000, 0x2000
+DWMMC0_CMDQ, DWMMC0_CMDQ_SIZE = 0x13508000, 0x200
+DWMMC0_IRQ = 178        # DT SPI 146 + the GIC's 32 private interrupts
 # Synthetic ECID, NOT the phone's: 'A30S' header word, then a fixed tail.
 A30S_ECID = 0x4133305300000001
 TIMEBASE = 26000000		# CNTFRQ at boot (P1.3), FDT clock-frequency 0x18cba80
@@ -193,6 +202,18 @@ def build():
         ('reg', u64(gicc_rel, GICC_SIZE, gicd_rel, GICD_SIZE)),
     ])
 
+    # eMMC host (dwmmc_0 in Samsung's A30s DTS). The CMDQ window is
+    # described separately; the initial driver path can leave CMDQ off.
+    emmc = node('dwmmc0', [
+        ph(),
+        ('compatible', cstr('samsung,exynos-dw-mshc')),
+        ('reg', u64(DWMMC0 - SOC_BASE, DWMMC0_SIZE)),
+        ('cmdq-reg', u64(DWMMC0_CMDQ - SOC_BASE, DWMMC0_CMDQ_SIZE)),
+        ('interrupt', u32(DWMMC0_IRQ)),
+        ('bus-width', u32(8)),
+        ('non-removable', u32(1)),
+    ])
+
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('a30s-io')),
@@ -202,6 +223,7 @@ def build():
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
     ], [
         gic,
+        emmc,
         # No hardware driver: watchdogd checks IODeviceTree:/arm-io/wdt
         # for no-pmu and otherwise crashes setting the PMU boot stage.
         node('wdt', [ph(), ('no-pmu', u32(1))]),

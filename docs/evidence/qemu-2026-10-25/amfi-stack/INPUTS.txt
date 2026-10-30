@@ -1,0 +1,9 @@
+Simulated QEMU AMFI stack snapshot inputs
+=========================================
+Kernel file: sibling candidate directory kernel.development.sweet
+Kernel SHA-256: 8d181ef91cb070cd0c5a5bf3d4bd4603df9c4c91915530a2859864c0ce8edd9d
+QEMU ADT SHA-256: c346f8e502a19ece15f2c07bb2399661ecf9bc9c0cb0f0ef47e18e742b186f42
+QEMU payload SHA-256: a3e258e8bc75cd432777fbcfeffea905658d475f5d36d44280e1d5832935f664
+QEMU: 11.1.2, virt/gicv2, TCG, cortex-a53, one CPU, 4 GiB
+Runtime: 30.016 seconds; harness paused guest, captured QMP state, then SIGKILLed QEMU.
+No phone hardware was involved. This is a snapshot, not a full boot result.

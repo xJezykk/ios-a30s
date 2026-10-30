@@ -1,0 +1,48 @@
+L entitlements)
+calling mpo_policy_init for vnguard
+Security policy loaded: Guarded vnode policy
+(vnguard)
+SWEET: trust caches unavailable (Image4/AMFI
+not installed)
+keepsyms boot arg specified; keeping linkedit
+ segment for symbols.
+No POST boot-arg set.
+SWEET: starting device-tree platform expert
+SWEET: platform expert registered
+SWEET AKS: AppleKeyStore registered (no passc
+ode, unlocked)
+SWEET WDT: IOWatchdog registered (accepts che
+ck-ins, never fires)
+SWEET SURF: IOCoreSurfaceRoot registered
+SWEET HID: buttons registered (test every 0 s
+)
+SWEET HID: touch registered
+SWEET BATTERY: static fallback, 100% 4200mV e
+xternal=1 charging=0
+SWEET FB: AppleCLCD 1080x2400 stride 4320 at
+0x9c000000, default surface 1, presented as 1
+125x2436
+
+
+zone_init: extra     0:0 (0B)
+VM bootstrap done: 61 maps, 112 entries and 1
+16 holes left
+Firehose configured: 16 chunks, 8 io pages
+Long logs support configured: size: 16384
+Log queues configured: slot count: 8, per-slo
+t size: 32768, total size: 262144
+OSLog stream configured: stream: 8192 bytes,
+cache: 2112 bytes
+OSLog stream verification: 0
+standard timeslicing quantum is 10000 us
+standard background quantum is 2500 us
+mig_table_max_displ = 54 mach_kobj_count = 37
+4
+kdp_core zlib memory 0x7000
+Serial requested, consistent debug disabled o
+r debug boot arg not present, configuring deb
+ugging over serial
+iBoot version: a30s-shim
+"name" not a kext
+"AAPL,phandle" not a kext
+SWEET AMFI: built-in interface registered (XM

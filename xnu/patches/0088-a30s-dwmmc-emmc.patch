@@ -1,0 +1,973 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 13d1c2f..149b6b9 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1,80 +1,884 @@
+ /*
+- * A30s DW-MMC handoff probe. This first stage is intentionally read-only:
+- * it records the controller state left by SBOOT and does not reset the host,
+- * change clocks, issue card commands, access the FIFO, or write media.
+- * Enable with boot-arg emmcprobe=1. A functioning root driver requires a
+- * separately validated Exynos clock/host initialization path.
++ * A30s Samsung DW-MMC0 eMMC block device.
++ *
++ * This uses polled PIO and the live bootloader clock source. Writes are
++ * disabled unless emmcw=1 is supplied, and are always confined to the
++ * GPT partition selected by emmcroot= (default: userdata).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+-#define EMMC_REG_SIZE   0x2000u
+-#define EMMC_CTRL       0x00u
+-#define EMMC_PWREN      0x04u
+-#define EMMC_CLKDIV     0x08u
+-#define EMMC_CLKSRC     0x0cu
+-#define EMMC_CLKENA     0x10u
+-#define EMMC_CTYPE      0x18u
+-#define EMMC_CMD        0x2cu
+-#define EMMC_MINTSTS    0x40u
+-#define EMMC_RINTSTS    0x44u
+-#define EMMC_STATUS     0x48u
+-#define EMMC_CDETECT    0x50u
+-#define EMMC_VERID      0x6cu
+-#define EMMC_HCON       0x70u
+-#define EMMC_UHS        0x74u
+-#define EMMC_BMOD       0x80u
+-#define EMMC_DBADDR     0x88u
+-#define EMMC_IDSTS      0x8cu
++#define EMMC_SOC_BASE           0x01000000u
++#define EMMC_REG_SIZE           0x2000u
++#define EMMC_FIFO_OFFSET        0x200u
++#define EMMC_MAX_BLOCKS         128u
++#define EMMC_BLOCK_SIZE         512u
++#define EMMC_MAX_XFER           (EMMC_MAX_BLOCKS * EMMC_BLOCK_SIZE)
++#define EMMC_TIMEOUT_NS         (2ull * NSEC_PER_SEC)
++#define EMMC_READY_NS           (5ull * NSEC_PER_SEC)
++
++#define REG_CTRL                0x000
++#define REG_PWREN               0x004
++#define REG_CLKDIV              0x008
++#define REG_CLKENA              0x010
++#define REG_TMOUT               0x014
++#define REG_CTYPE               0x018
++#define REG_BLKSIZ              0x01c
++#define REG_BYTCNT              0x020
++#define REG_CMD                 0x02c
++#define REG_INTMASK             0x024
++#define REG_RINTSTS             0x044
++#define REG_STATUS              0x048
++#define REG_FIFOTH              0x04c
++#define REG_VERID               0x06c
++#define REG_HCON                0x070
++#define REG_UHS                 0x074
++#define REG_CLKSEL              0x0a8
++
++#define CMD_START               (1u << 31)
++#define CMD_INIT                (1u << 15)
++#define CMD_STOP_ABORT          (1u << 14)
++#define CMD_WAIT_PRVDATA        (1u << 13)
++#define CMD_UPDATE_CLOCK        (1u << 21)
++#define CMD_WRITE               (1u << 10)
++#define CMD_DATA_EXPECT         (1u << 9)
++#define CMD_RESP_CRC            (1u << 8)
++#define CMD_RESP_LONG           (1u << 7)
++#define CMD_RESP_EXPECT         (1u << 6)
++#define CTRL_INT_ENABLE         (1u << 4)
++#define CTRL_DMA_ENABLE         (1u << 5)
++#define CTRL_USE_IDMAC          (1u << 25)
++
++#define INT_DATA_OVER           (1u << 3)
++#define INT_CMD_DONE            (1u << 2)
++#define INT_ERRORS              0x0000bfc2u
++#define STATUS_DATA_BUSY        (1u << 9)
++#define STATUS_FIFO_FULL        (1u << 3)
++#define STATUS_FIFO_EMPTY       (1u << 2)
++#define STATUS_FIFO_COUNT(v)    (((v) >> 17) & 0x1fffu)
++
++#define RSP_R1                  (CMD_RESP_EXPECT | CMD_RESP_CRC)
++#define RSP_R1B                 RSP_R1
++#define RSP_R2                  (CMD_RESP_EXPECT | CMD_RESP_CRC | CMD_RESP_LONG)
++#define R1_ERROR_MASK           0xffff8000u
++#define R1_SWITCH_ERROR         (1u << 7)
++
++static struct {
++	vm_offset_t regs;
++	uint64_t card_sectors;
++	uint64_t first_sector;
++	uint64_t partition_sectors;
++	uint8_t ext_csd[EMMC_BLOCK_SIZE];
++	uint32_t secsize;
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool writable;
++	bool ready;
++} se;
++
++static uint8_t emmc_gpt_sector[EMMC_BLOCK_SIZE];
++static uint8_t emmc_gpt_entries[EMMC_MAX_XFER];
++static uint8_t emmc_bounce[EMMC_MAX_XFER + EMMC_BLOCK_SIZE];
++
++static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
++static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
++
++static inline uint32_t
++emmc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(se.regs + off);
++}
++
++static inline void
++emmc_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(se.regs + off) = value;
++}
+ 
+ static uint32_t
+-emmc_read(volatile uint8_t *base, uint32_t offset)
++emmc_crc32(const uint8_t *data, uint32_t length)
++{
++	uint32_t crc = 0xffffffffu;
++	while (length--) {
++		crc ^= *data++;
++		for (unsigned bit = 0; bit < 8; bit++) {
++			crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++		}
++	}
++	return ~crc;
++}
++
++static uint64_t
++emmc_deadline(uint64_t ns)
++{
++	uint64_t ticks;
++	nanoseconds_to_absolutetime(ns, &ticks);
++	return mach_absolute_time() + ticks;
++}
++
++static int
++emmc_wait_clear(uint32_t off, uint32_t mask, uint64_t deadline)
++{
++	while (emmc_rd(off) & mask) {
++		if (mach_absolute_time() >= deadline) {
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static int
++emmc_wait_not_busy(uint64_t deadline)
++{
++	while (emmc_rd(REG_STATUS) & STATUS_DATA_BUSY) {
++		if (mach_absolute_time() >= deadline) {
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static int
++emmc_update_clock(void)
++{
++	uint64_t deadline = emmc_deadline(EMMC_TIMEOUT_NS);
++	emmc_wr(REG_CMD, CMD_START | CMD_UPDATE_CLOCK);
++	return emmc_wait_clear(REG_CMD, CMD_START, deadline);
++}
++
++static int
++emmc_set_clock_divider(uint32_t divider)
++{
++	uint32_t enabled = emmc_rd(REG_CLKENA);
++	int error;
++
++	emmc_wr(REG_CLKENA, enabled & ~1u);
++	if ((error = emmc_update_clock()) != 0) {
++		return error;
++	}
++	emmc_wr(REG_CLKDIV, divider);
++	if ((error = emmc_update_clock()) != 0) {
++		return error;
++	}
++	emmc_wr(REG_CLKENA, enabled | 1u);
++	return emmc_update_clock();
++}
++
++static int
++emmc_cmd(uint32_t index, uint32_t argument, uint32_t flags, uint32_t *response)
++{
++	uint64_t deadline = emmc_deadline(EMMC_TIMEOUT_NS);
++	uint32_t status;
++	int error;
++
++	emmc_wr(REG_RINTSTS, 0xffffffffu);
++	emmc_wr(0x028, argument);
++	emmc_wr(REG_CMD, CMD_START | flags | (index & 0x3fu));
++	if ((error = emmc_wait_clear(REG_CMD, CMD_START, deadline)) != 0) {
++		return error;
++	}
++	for (;;) {
++		status = emmc_rd(REG_RINTSTS);
++		if (status & INT_ERRORS) {
++			return EIO;
++		}
++		if (status & INT_CMD_DONE) {
++			break;
++		}
++		if (mach_absolute_time() >= deadline) {
++			return ETIMEDOUT;
++		}
++	}
++	if (response != NULL) {
++		*response = emmc_rd(0x030);
++	}
++	return 0;
++}
++
++static int
++emmc_data_command(uint32_t index, uint32_t argument, bool write,
++    uint32_t blocks, void *buffer)
++{
++	uint32_t bytes = blocks * EMMC_BLOCK_SIZE;
++	uint32_t command, status, done = 0;
++	uint8_t *p = buffer;
++	uint64_t deadline = emmc_deadline(EMMC_TIMEOUT_NS);
++	int error;
++
++	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS) {
++		return EINVAL;
++	}
++	emmc_wr(REG_BLKSIZ, EMMC_BLOCK_SIZE);
++	emmc_wr(REG_BYTCNT, bytes);
++	emmc_wr(REG_RINTSTS, 0xffffffffu);
++	command = CMD_START | CMD_WAIT_PRVDATA | CMD_DATA_EXPECT | RSP_R1 | index;
++	if (write) {
++		command |= CMD_WRITE;
++	}
++	emmc_wr(0x028, argument);
++	emmc_wr(REG_CMD, command);
++	if ((error = emmc_wait_clear(REG_CMD, CMD_START, deadline)) != 0) {
++		return error;
++	}
++
++	while (done < bytes) {
++		status = emmc_rd(REG_RINTSTS);
++		if (status & INT_ERRORS) {
++			return EIO;
++		}
++		status = emmc_rd(REG_STATUS);
++		if (write) {
++			if (!(status & STATUS_FIFO_FULL)) {
++				uint32_t value = 0;
++				uint32_t n = MIN(bytes - done, (uint32_t)sizeof(value));
++				memcpy(&value, p + done, n);
++				emmc_wr(EMMC_FIFO_OFFSET, value);
++				done += n;
++			}
++		} else if (!(status & STATUS_FIFO_EMPTY)) {
++			uint32_t words = STATUS_FIFO_COUNT(status);
++			if (words == 0) {
++				words = 1;
++			}
++			while (words-- && done < bytes) {
++				uint32_t value = emmc_rd(EMMC_FIFO_OFFSET);
++				uint32_t n = MIN(bytes - done, (uint32_t)sizeof(value));
++				memcpy(p + done, &value, n);
++				done += n;
++			}
++		}
++		if (mach_absolute_time() >= deadline) {
++			return ETIMEDOUT;
++		}
++	}
++
++	for (;;) {
++		status = emmc_rd(REG_RINTSTS);
++		if (status & INT_ERRORS) {
++			return EIO;
++		}
++		if (status & INT_DATA_OVER) {
++			break;
++		}
++		if (mach_absolute_time() >= deadline) {
++			return ETIMEDOUT;
++		}
++	}
++	emmc_wr(REG_RINTSTS, INT_DATA_OVER | INT_CMD_DONE);
++	if (blocks > 1) {
++		error = emmc_cmd(12, 0, CMD_STOP_ABORT | RSP_R1B, NULL);
++		if (error != 0) {
++			return error;
++		}
++	}
++	return emmc_wait_not_busy(deadline);
++}
++
++static int
++emmc_transfer(uint64_t lba, uint32_t blocks, void *buffer, bool write)
++{
++	uint32_t argument;
++	int error;
++
++	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS ||
++	    lba >= se.card_sectors || blocks > se.card_sectors - lba ||
++	    lba > UINT32_MAX) {
++		return EINVAL;
++	}
++	if (write && (!se.writable || lba < se.first_sector ||
++	    lba - se.first_sector >= se.partition_sectors ||
++	    blocks > se.partition_sectors - (lba - se.first_sector))) {
++		return EPERM;
++	}
++	argument = (uint32_t)lba;
++	error = emmc_data_command(blocks > 1 ? (write ? 25 : 18) :
++	    (write ? 24 : 17), argument, write, blocks, buffer);
++	if (error == 0 && write) {
++		uint64_t deadline = emmc_deadline(EMMC_READY_NS);
++		uint32_t response = 0;
++		do {
++			error = emmc_cmd(13, 1u << 16, RSP_R1, &response);
++			if (error != 0) {
++				return error;
++			}
++			if (response & R1_ERROR_MASK) {
++				return EIO;
++			}
++			if ((response & (1u << 8)) &&
++			    (((response >> 9) & 0xfu) == 4u)) {
++				break;
++			}
++			if (mach_absolute_time() >= deadline) {
++				return ETIMEDOUT;
++			}
++		} while (true);
++	}
++	return error;
++}
++
++static int
++emmc_switch(uint8_t index, uint8_t value)
++{
++	uint32_t response = 0;
++	int error = emmc_cmd(6, (3u << 24) | ((uint32_t)index << 16) |
++	    ((uint32_t)value << 8), RSP_R1B, &response);
++	if (error != 0) {
++		return error;
++	}
++	if (response & (R1_ERROR_MASK | R1_SWITCH_ERROR)) {
++		return EIO;
++	}
++	return emmc_wait_not_busy(emmc_deadline(EMMC_TIMEOUT_NS));
++}
++
++static int
++emmc_wait_ready(void)
++{
++	uint64_t deadline = emmc_deadline(EMMC_READY_NS);
++	uint32_t response = 0;
++	int error;
++
++	do {
++		error = emmc_cmd(13, 1u << 16, RSP_R1, &response);
++		if (error != 0) {
++			return error;
++		}
++		if (response & R1_ERROR_MASK) {
++			return EIO;
++		}
++		if ((response & (1u << 8)) &&
++		    (((response >> 9) & 0xfu) == 4u)) {
++			return 0;
++		}
++	} while (mach_absolute_time() < deadline);
++	return ETIMEDOUT;
++}
++
++static int
++emmc_flush_cache(void)
++{
++	if (se.ext_csd[33] & 1u) {
++		return emmc_switch(32, 1);
++	}
++	return emmc_wait_ready();
++}
++
++static int
++emmc_initialize_card(void)
++{
++	uint32_t ocr = 0;
++	uint8_t ext_csd[EMMC_BLOCK_SIZE];
++	uint64_t deadline;
++	uint32_t sector_count;
++	int error;
++
++	/* Keep initial negotiation at <=400 kHz, independent of parent rate. */
++	if ((error = emmc_set_clock_divider(0xff)) != 0) {
++		return error;
++	}
++	/* A30s SDR timing is CLKSEL 0x03040000; boot handed off 0x03040002. */
++	emmc_wr(REG_CLKSEL, emmc_rd(REG_CLKSEL) & ~7u);
++	emmc_wr(REG_UHS, emmc_rd(REG_UHS) & ~1u);
++	emmc_wr(REG_CTYPE, 0);
++	if ((error = emmc_cmd(0, 0, CMD_INIT, NULL)) != 0) {
++		return error;
++	}
++	deadline = emmc_deadline(EMMC_READY_NS);
++	do {
++		error = emmc_cmd(1, 0x40ff8000u, CMD_RESP_EXPECT, &ocr);
++		if (error != 0) {
++			return error;
++		}
++		if (ocr & (1u << 31)) {
++			break;
++		}
++	} while (mach_absolute_time() < deadline);
++	if (!(ocr & (1u << 31)) || !(ocr & (1u << 30))) {
++		return ENXIO;
++	}
++	if ((error = emmc_cmd(2, 0, RSP_R2, NULL)) != 0) {
++		return error;
++	}
++	{
++		uint32_t response = 0;
++		if ((error = emmc_cmd(3, 1u << 16, RSP_R1, &response)) != 0 ||
++		    (response & R1_ERROR_MASK)) {
++			return error ? error : EIO;
++		}
++		if ((error = emmc_cmd(7, 1u << 16, RSP_R1B, &response)) != 0 ||
++		    (response & R1_ERROR_MASK)) {
++			return error ? error : EIO;
++		}
++	}
++	if ((error = emmc_wait_not_busy(emmc_deadline(EMMC_TIMEOUT_NS))) != 0) {
++		return error;
++	}
++	emmc_wr(REG_BLKSIZ, EMMC_BLOCK_SIZE);
++	emmc_wr(REG_BYTCNT, EMMC_BLOCK_SIZE);
++	{
++		uint32_t response = 0;
++		if ((error = emmc_cmd(8, 0,
++		    RSP_R1 | CMD_WAIT_PRVDATA | CMD_DATA_EXPECT,
++		    &response)) != 0 || (response & R1_ERROR_MASK)) {
++			return error ? error : EIO;
++		}
++	}
++	/* CMD8 SEND_EXT_CSD uses the host's data path. */
++	{
++		uint32_t done = 0;
++		uint64_t data_deadline = emmc_deadline(EMMC_TIMEOUT_NS);
++		while (done < sizeof(ext_csd)) {
++			uint32_t status = emmc_rd(REG_STATUS);
++			if (!(status & STATUS_FIFO_EMPTY)) {
++				uint32_t value = emmc_rd(EMMC_FIFO_OFFSET);
++				uint32_t n = MIN(sizeof(ext_csd) - done, sizeof(value));
++				memcpy(ext_csd + done, &value, n);
++				done += n;
++			} else if (mach_absolute_time() >= data_deadline) {
++				return ETIMEDOUT;
++			}
++		}
++		while (!(emmc_rd(REG_RINTSTS) & INT_DATA_OVER)) {
++			if (emmc_rd(REG_RINTSTS) & INT_ERRORS) {
++				return EIO;
++			}
++			if (mach_absolute_time() >= data_deadline) {
++				return ETIMEDOUT;
++			}
++		}
++		emmc_wr(REG_RINTSTS, INT_DATA_OVER | INT_CMD_DONE);
++	}
++	if ((error = emmc_wait_not_busy(emmc_deadline(EMMC_TIMEOUT_NS))) != 0) {
++		return error;
++	}
++	memcpy(se.ext_csd, ext_csd, sizeof(ext_csd));
++	memcpy(&sector_count, ext_csd + 212, sizeof(sector_count));
++	se.card_sectors = sector_count;
++	if (se.card_sectors == 0) {
++		return ENXIO;
++	}
++	if ((ext_csd[179] & 7u) != 0) {
++		printf("SWEET eMMC: refusing non-user hardware partition %u\n",
++		    ext_csd[179] & 7u);
++		return ENXIO;
++	}
++	if (ext_csd[183] != 2) {
++		if ((error = emmc_switch(183, 2)) != 0) {
++			return error;
++		}
++	}
++	emmc_wr(REG_CTYPE, 1u << 16);
++	/* 799.5 MHz / (3 + 1) / (2 * 4) = 24.984 MHz, legacy-safe. */
++	return emmc_set_clock_divider(4);
++}
++
++static int
++emmc_find_partition(const char *want)
++{
++	uint64_t entry_lba;
++	uint64_t first_usable, last_usable;
++	uint32_t count, size, header_size, header_crc, entries_crc;
++	uint64_t current_lba;
++	int error;
++
++	if ((error = emmc_transfer(1, 1, emmc_gpt_sector, false)) != 0) {
++		return error;
++	}
++	if (memcmp(emmc_gpt_sector, "EFI PART", 8) != 0) {
++		printf("SWEET eMMC: user area has no GPT\n");
++		return ENXIO;
++	}
++	memcpy(&header_size, emmc_gpt_sector + 12, sizeof(header_size));
++	memcpy(&header_crc, emmc_gpt_sector + 16, sizeof(header_crc));
++	memcpy(&current_lba, emmc_gpt_sector + 24, sizeof(current_lba));
++	memcpy(&entry_lba, emmc_gpt_sector + 72, sizeof(entry_lba));
++	memcpy(&count, emmc_gpt_sector + 80, sizeof(count));
++	memcpy(&size, emmc_gpt_sector + 84, sizeof(size));
++	memcpy(&entries_crc, emmc_gpt_sector + 88, sizeof(entries_crc));
++	memcpy(&first_usable, emmc_gpt_sector + 40, sizeof(first_usable));
++	memcpy(&last_usable, emmc_gpt_sector + 48, sizeof(last_usable));
++	if (header_size < 92 || header_size > EMMC_BLOCK_SIZE ||
++	    current_lba != 1) {
++		return ENXIO;
++	}
++	{
++		uint8_t header[EMMC_BLOCK_SIZE];
++		memcpy(header, emmc_gpt_sector, header_size);
++		memset(header + 16, 0, sizeof(header_crc));
++		if (header_crc != emmc_crc32(header, header_size)) {
++			return ENXIO;
++		}
++	}
++	if (size != 128 || count == 0 ||
++	    count > sizeof(emmc_gpt_entries) / size ||
++	    entry_lba >= se.card_sectors || first_usable > last_usable ||
++	    last_usable >= se.card_sectors) {
++		return ENXIO;
++	}
++	uint32_t bytes = count * size;
++	uint32_t blocks = (bytes + EMMC_BLOCK_SIZE - 1) / EMMC_BLOCK_SIZE;
++	if (blocks > EMMC_MAX_BLOCKS || blocks > se.card_sectors - entry_lba) {
++		return ENXIO;
++	}
++	if ((error = emmc_transfer(entry_lba, blocks, emmc_gpt_entries, false)) != 0) {
++		return error;
++	}
++	if (entries_crc != emmc_crc32(emmc_gpt_entries, bytes)) {
++		return ENXIO;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		const uint8_t *entry = emmc_gpt_entries + i * size;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)entry[56 + 2 * c] |
++			    ((uint16_t)entry[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = '\0';
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, entry + 32, sizeof(first));
++		memcpy(&last, entry + 40, sizeof(last));
++		if (last < first || first < first_usable || last > last_usable) {
++			return ENXIO;
++		}
++		se.first_sector = first;
++		se.partition_sectors = last - first + 1;
++		return 0;
++	}
++	printf("SWEET eMMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++static int
++sweet_emmc_open(__unused dev_t dev, int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	if (!se.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !se.writable) ? EROFS : 0;
++}
++
++static int
++sweet_emmc_close(__unused dev_t dev, __unused int flags,
++    __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_emmc_strategy(buf_t bp)
++{
++	uint64_t offset = (uint64_t)buf_blkno(bp) * se.secsize;
++	uint32_t count = buf_count(bp), done = 0;
++	uint64_t partition_bytes = se.partition_sectors * EMMC_BLOCK_SIZE;
++	caddr_t address = NULL;
++	bool read = (buf_flags(bp) & B_READ) != 0;
++	int error = 0;
++
++	buf_setresid(bp, count);
++	if (!read && !se.writable) {
++		error = EROFS;
++		goto finish;
++	}
++	if (offset > partition_bytes || count > partition_bytes - offset) {
++		error = EINVAL;
++		goto finish;
++	}
++	if (count == 0) {
++		goto finish;
++	}
++	if (buf_map(bp, &address)) {
++		error = EIO;
++		goto finish;
++	}
++	lck_mtx_lock(&sweet_emmc_lock);
++	while (done < count) {
++		uint64_t position = offset + done;
++		uint64_t lba = se.first_sector + position / EMMC_BLOCK_SIZE;
++		uint32_t skip = (uint32_t)(position % EMMC_BLOCK_SIZE);
++		uint32_t bytes = MIN(count - done, EMMC_MAX_XFER - skip);
++		uint32_t blocks = (skip + bytes + EMMC_BLOCK_SIZE - 1) /
++		    EMMC_BLOCK_SIZE;
++		if (read) {
++			error = emmc_transfer(lba, blocks, emmc_bounce, false);
++			if (!error) {
++				memcpy(address + done, emmc_bounce + skip, bytes);
++			}
++		} else {
++			if (skip || (bytes % EMMC_BLOCK_SIZE)) {
++				error = emmc_transfer(lba, blocks, emmc_bounce, false);
++			}
++			if (!error) {
++				memcpy(emmc_bounce + skip, address + done, bytes);
++				error = emmc_transfer(lba, blocks, emmc_bounce, true);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += bytes;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	buf_unmap(bp);
++finish:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_emmc_ioctl(__unused dev_t dev, u_long command, caddr_t data,
++    __unused int flag, __unused struct proc *p, int is_char)
++{
++	uint32_t *value = (uint32_t *)data;
++	uint64_t *wide = (uint64_t *)data;
++	switch (command) {
++	case DKIOCGETBLOCKSIZE:
++		*value = se.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*value < DEV_BSIZE || *value > EMMC_BLOCK_SIZE ||
++		    (*value & (*value - 1))) {
++			return EINVAL;
++		}
++		se.secsize = *value;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*value = EMMC_BLOCK_SIZE;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*wide = se.partition_sectors * EMMC_BLOCK_SIZE / se.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*value = se.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		if (!se.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&sweet_emmc_lock);
++		{
++			int error = emmc_flush_cache();
++			lck_mtx_unlock(&sweet_emmc_lock);
++			return error;
++		}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*wide = EMMC_MAX_XFER / se.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*wide = se.writable ? EMMC_MAX_XFER / se.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*wide = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_emmc_bioctl(dev_t dev, u_long command, caddr_t data, int flag,
++    struct proc *p)
+ {
+-	return *(volatile uint32_t *)(base + offset);
++	return sweet_emmc_ioctl(dev, command, data, flag, p, 0);
+ }
+ 
++static int
++sweet_emmc_cioctl(dev_t dev, u_long command, caddr_t data, int flag,
++    struct proc *p)
++{
++	return sweet_emmc_ioctl(dev, command, data, flag, p, 1);
++}
++
++static int
++sweet_emmc_psize(__unused dev_t dev)
++{
++	return se.ready ? (int)MIN(se.partition_sectors * EMMC_BLOCK_SIZE /
++	    se.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_emmc_strategy, NULL, dev, B_READ, minphys, uio,
++	    (int)se.secsize);
++}
++
++static int
++sweet_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!se.writable) {
++		return EROFS;
++	}
++	return physio(sweet_emmc_strategy, NULL, dev, B_WRITE, minphys, uio,
++	    (int)se.secsize);
++}
++
++static const struct bdevsw sweet_emmc_bdevsw = {
++	.d_open     = sweet_emmc_open,
++	.d_close    = sweet_emmc_close,
++	.d_strategy = sweet_emmc_strategy,
++	.d_ioctl    = sweet_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_emmc_cdevsw = {
++	.d_open       = sweet_emmc_open,
++	.d_close      = sweet_emmc_close,
++	.d_read       = sweet_emmc_read,
++	.d_write      = sweet_emmc_write,
++	.d_ioctl      = sweet_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++emmc_map_controller(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++
++	if (se.regs != 0) {
++		return 0;
++	}
++	if (SecureDTLookupEntry(NULL, "/arm-io/dwmmc0", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t) || reg[1] < EMMC_REG_SIZE ||
++	    reg[0] > UINT32_MAX - EMMC_SOC_BASE) {
++		printf("SWEET eMMC: missing or invalid /arm-io/dwmmc0 reg\n");
++		return ENXIO;
++	}
++	se.regs = ml_io_map((vm_offset_t)(EMMC_SOC_BASE + reg[0]),
++	    (vm_size_t)reg[1]);
++	return se.regs == 0 ? ENXIO : 0;
++}
++
++static int
++sweet_emmc_init(void)
++{
++	char partition[64] = "userdata";
++	uint32_t rw = 0;
++	int error = emmc_map_controller();
++
++	if (error != 0) {
++		return error;
++	}
++	PE_parse_boot_argn("emmcroot", partition, sizeof(partition));
++	PE_parse_boot_argn("emmcw", &rw, sizeof(rw));
++	if (emmc_rd(REG_VERID) != 0x5342270au ||
++	    emmc_rd(REG_HCON) != 0x08e42541u ||
++	    ((emmc_rd(REG_CLKSEL) >> 24) & 7u) != 3u ||
++	    !(emmc_rd(REG_PWREN) & 1u) || !(emmc_rd(REG_CLKENA) & 1u)) {
++		printf("SWEET eMMC: unexpected controller handoff (ver=%08x hcon=%08x clksel=%08x)\n",
++		    emmc_rd(REG_VERID), emmc_rd(REG_HCON), emmc_rd(REG_CLKSEL));
++		return ENXIO;
++	}
++	if (emmc_rd(REG_CTRL) & (CTRL_DMA_ENABLE | CTRL_USE_IDMAC)) {
++		printf("SWEET eMMC: refusing host with DMA active (ctrl=%08x)\n",
++		    emmc_rd(REG_CTRL));
++		return ENXIO;
++	}
++	emmc_wr(REG_INTMASK, 0);
++	emmc_wr(REG_CTRL, emmc_rd(REG_CTRL) & ~CTRL_INT_ENABLE);
++	se.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	error = emmc_initialize_card();
++	if (!error) {
++		error = emmc_find_partition(partition);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	if (error) {
++		printf("SWEET eMMC: initialization failed: %d\n", error);
++		return error;
++	}
++	se.bmajor = bdevsw_add(-1, &sweet_emmc_bdevsw);
++	if (se.bmajor < 0) {
++		return ENXIO;
++	}
++	se.cmajor = cdevsw_add_with_bdev(-1, &sweet_emmc_cdevsw, se.bmajor);
++	if (se.cmajor < 0) {
++		return ENXIO;
++	}
++	se.bdev = makedev(se.bmajor, 0);
++	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
++	    "emmcroot0");
++	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_OPERATOR, 0640, "remmcroot0");
++	/* Enable writes only after the selected partition has been bounded. */
++	se.writable = (rw == 1);
++	se.ready = true;
++	printf("SWEET eMMC: \"%s\": LBA 0x%llx, %llu MiB, %s, 8-bit PIO\n",
++	    partition, se.first_sector,
++	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
++	    se.writable ? "read-write" : "read-only");
++	return 0;
++}
++
++int
++sweet_emmc_rootdev(dev_t *dev)
++{
++	if (!se.ready) {
++		int error = sweet_emmc_init();
++		if (error != 0) {
++			return error;
++		}
++	}
++	*dev = se.bdev;
++	return 0;
++}
++
++/* Preserve the earlier opt-in, read-only register snapshot. */
+ void
+ sweet_emmc_probe(void)
+ {
+ 	uint32_t enabled = 0;
+-	DTEntry node;
+-	uintptr_t const *reg = NULL;
+-	unsigned int reg_size = 0;
+-	volatile uint8_t *base;
+-
+-	if (!PE_parse_boot_argn("emmcprobe", &enabled, sizeof(enabled)) || !enabled) {
+-		return;
+-	}
+-	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &reg_size) != kSuccess ||
+-	    reg_size < 2 * sizeof(uintptr_t) || reg[1] < EMMC_REG_SIZE) {
+-		printf("SWEET eMMC probe: missing or invalid /sweet-emmc reg\n");
+-		return;
+-	}
+-	base = (volatile uint8_t *)ml_io_map((vm_offset_t)reg[0], (vm_size_t)reg[1]);
+-	if (base == NULL) {
+-		printf("SWEET eMMC probe: MMIO mapping failed\n");
+-		return;
+-	}
+-	printf("SWEET eMMC probe: pa=%p size=0x%lx ver=0x%08x hcon=0x%08x\n",
+-	    (void *)reg[0], (unsigned long)reg[1],
+-	    emmc_read(base, EMMC_VERID), emmc_read(base, EMMC_HCON));
+-	printf("SWEET eMMC probe: ctrl=%08x pwr=%08x clkdiv=%08x clksrc=%08x clkena=%08x ctype=%08x\n",
+-	    emmc_read(base, EMMC_CTRL), emmc_read(base, EMMC_PWREN),
+-	    emmc_read(base, EMMC_CLKDIV), emmc_read(base, EMMC_CLKSRC),
+-	    emmc_read(base, EMMC_CLKENA), emmc_read(base, EMMC_CTYPE));
+-	printf("SWEET eMMC probe: cmd=%08x mintsts=%08x rintsts=%08x status=%08x cdetect=%08x\n",
+-	    emmc_read(base, EMMC_CMD), emmc_read(base, EMMC_MINTSTS),
+-	    emmc_read(base, EMMC_RINTSTS), emmc_read(base, EMMC_STATUS),
+-	    emmc_read(base, EMMC_CDETECT));
+-	printf("SWEET eMMC probe: uhs=%08x bmod=%08x dbaddr=%08x idsts=%08x (no writes issued)\n",
+-	    emmc_read(base, EMMC_UHS), emmc_read(base, EMMC_BMOD),
+-	    emmc_read(base, EMMC_DBADDR), emmc_read(base, EMMC_IDSTS));
++	if (PE_parse_boot_argn("emmcprobe", &enabled, sizeof(enabled)) && enabled &&
++	    emmc_map_controller() == 0) {
++		printf("SWEET eMMC probe: ver=%08x hcon=%08x clksel=%08x status=%08x\n",
++		    emmc_rd(REG_VERID), emmc_rd(REG_HCON), emmc_rd(REG_CLKSEL),
++		    emmc_rd(REG_STATUS));
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..d9b5744 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,21 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int sweet_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = sweet_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: SWEET eMMC root %s unavailable: %d",
++			    rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName,
++		    major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //

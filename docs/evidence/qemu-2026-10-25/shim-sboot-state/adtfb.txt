@@ -1,0 +1,48 @@
+L entitlements)
+calling mpo_policy_init for vnguard
+Security policy loaded: Guarded vnode policy
+(vnguard)
+SWEET: trust caches unavailable (Image4/AMFI
+not installed)
+keepsyms boot arg specified; keeping linkedit
+ segment for symbols.
+No POST boot-arg set.
+SWEET: starting device-tree platform expert
+SWEET: platform expert registered
+SWEET AKS: AppleKeyStore registered (no passc
+ode, unlocked)
+SWEET WDT: IOWatchdog registered (accepts che
+ck-ins, never fires)
+SWEET SURF: IOCoreSurfaceRoot registered
+SWEET HID: buttons registered (test every 0 s
+)
+SWEET HID: touch registered
+SWEET BATTERY: static fallback, 100% 4200mV e
+xternal=1 charging=0
+IOMemoryDescriptor physical with managed page
+ 0xec000000:0x449000
+Backtrace 0xfffffff0079cdeb0 0xfffffff0079cd9
+88 0xfffffff007a4425c 0xfffffff007a476f0 0xff
+fffff007992ba0 0xfffffff007992194 0xfffffff00
+798ba20
+         can't perform kext scan: no kext sum
+marySWEET FB: AppleCLCD 720x1560 stride 2880
+at 0xec000000, default surface 1, presented a
+s 1125x2436
+
+
+OSLog stream configured: stream: 8192 bytes,
+cache: 2112 bytes
+OSLog stream verification: 0
+standard timeslicing quantum is 10000 us
+standard background quantum is 2500 us
+mig_table_max_displ = 54 mach_kobj_count = 37
+4
+kdp_core zlib memory 0x7000
+Serial requested, consistent debug disabled o
+r debug boot arg not present, configuring deb
+ugging over serial
+iBoot version: a30s-shim
+"name" not a kext
+"AAPL,phandle" not a kext
+SWEET AMFI: built-in interface registered (XM

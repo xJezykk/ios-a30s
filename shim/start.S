@@ -2,7 +2,8 @@
  * a30s boot shim entry. Mirrors ios-sweet/shim/start.S (MIT) with the
  * Samsung-specific bits added: SBOOT's entry privilege level is
  * unknown, so the code drops EL2 down to EL1 before running the C
- * probe. x0 (the live FDT pointer) is preserved across the drop.
+ * probe and parks safely if entered at unsupported EL3. x0 (the live
+ * FDT pointer) is preserved across the drop.
  * The IMAGE header follows the Linux arm64 protocol so SBOOT treats us
  * like a kernel: we are loaded where the stock kernel loads (0x10008000)
  * with no relocation pass (runs wherever it lands).
@@ -37,9 +38,8 @@ _start:
 	cmp	x20, #0x8
 	b.eq	2f
 	cmp	x20, #0xc
-	b.eq	1f
+	b.eq	4f
 	b	3f
-1:	/* EL3: nothing sane to do at EL3; drop to EL1 the same way. */
 2:	/* EL2: handoff to EL1 (AArch64, DAIF masked). */
 	mov	x3, xzr
 	msr	hcr_el2, x3
@@ -76,6 +76,9 @@ el1_entry:
 	bl	shim_main
 3:	wfe
 	b	3b
+4:	/* EL3 return state is not established by this port. */
+	wfe
+	b	4b
 
 /*
  * PSCI CPU_ON target; x0 = whatever the firmware delivers (nominally
